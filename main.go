@@ -81,7 +81,7 @@ func (ic *ircClient) connect() error {
 		// MOTD finished: join now
 		if bytes.Contains(message, []byte("End of /MOTD command.")) {
 			// nick registration
-			in.Privmsg("NickServ", "IDENTIFY %s", registrationPassword)
+			in.Privmsg("NickServ", "IDENTIFY %s", ic.registrationPassword)
 			// leave time for roundtrip
 			time.Sleep(time.Second)
 
@@ -642,11 +642,12 @@ type downloadProcess struct {
 type ircClient struct {
 	fileFetcher fsHandler
 
-	connMutex sync.Mutex
-	nickname  string
-	channel   string
-	myIP      uint32
-	localIP   string
+	connMutex            sync.Mutex
+	nickname             string
+	registrationPassword string
+	channel              string
+	myIP                 uint32
+	localIP              string
 
 	// channel stores requests by clients, they will be processed when a slot is free
 	downloadRequestsChan chan downloadRequest
@@ -718,14 +719,11 @@ func mustExtractIP() uint32 {
 	return ip2int(ip)
 }
 
-const (
-	registrationPassword = ""
-)
-
 func main() {
 	fsAccess := os.DirFS(rootSavePath)
 	lookupID, lookupPack := mustBuildLookups(fsAccess)
 
+	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "")
 	joinChan := getEnvFallback("CHANNEL", "#exter-periment")
 	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68")
 	portsStr := strings.Split(getEnvFallback("PORTS", "38542,38543"), ",")
@@ -742,6 +740,7 @@ func main() {
 
 	c := ircClient{
 		nickname:                    "Fulminata|Experiment",
+		registrationPassword:        registrationPassword,
 		channel:                     joinChan,
 		localIP:                     localIP,
 		myIP:                        mustExtractIP(),

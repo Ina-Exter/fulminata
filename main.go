@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,6 +46,10 @@ func (ircw *ircWriter) Privmsg(to, format string, args ...any) (int, error) {
 	return ircw.Writer.Write(fmt.Appendf([]byte{}, fmt.Sprintf("PRIVMSG %v :", to)+format, args...))
 }
 
+func (ircw *ircWriter) Notice(to, format string, args ...any) (int, error) {
+	return ircw.Writer.Write(fmt.Appendf([]byte{}, fmt.Sprintf("NOTICE %v :", to)+format, args...))
+}
+
 func (ic *ircClient) connect() error {
 	fmt.Println("client connecting")
 
@@ -63,6 +68,10 @@ func (ic *ircClient) connect() error {
 			msgData := bytes.Clone(outScan.Bytes())
 			fmt.Println(string(msgData))
 			messageChan <- msgData
+
+			if err := outScan.Err(); err != nil {
+				ic.errChan <- err
+			}
 		}
 	}()
 
@@ -81,7 +90,9 @@ func (ic *ircClient) connect() error {
 		// MOTD finished: join now
 		if bytes.Contains(message, []byte("End of /MOTD command.")) {
 			// nick registration
-			in.Privmsg("NickServ", "IDENTIFY %s", ic.registrationPassword)
+			if ic.registrationPassword != "" {
+				in.Privmsg("NickServ", "IDENTIFY %s", ic.registrationPassword)
+			}
 			// leave time for roundtrip
 			time.Sleep(time.Second)
 
@@ -103,7 +114,7 @@ func (ic *ircClient) connect() error {
 			select {
 			case message := <-messageChan: // message received on serv, process accordingly
 				ic.ircMessageHandler(in, message)
-			case <-ic.shutdownChan:
+			case <-ic.shutdownChans["irc"]:
 				return
 			}
 		}
@@ -117,7 +128,7 @@ func (ic *ircClient) connect() error {
 					ic.dequeue(req.Hostname, req)
 					in.Privmsg(req.Nick, "Cannot process your download request: %s", err.Error())
 				}
-			case <-ic.shutdownChan:
+			case <-ic.shutdownChans["dcc"]:
 				return
 			}
 		}
@@ -127,63 +138,78 @@ func (ic *ircClient) connect() error {
 }
 
 func (ic *ircClient) ircMessageHandler(in *ircWriter, message []byte) {
-	// handle PONG
-	if ts, ok := bytes.CutPrefix(message, []byte("PING")); ok {
-		in.Write([]byte("PONG" + string(ts) + "\n"))
+	ifMsg := Parse(message)
 
-		return
-	}
-
-	// handle CTCP calls
-	if bytes.Contains(message, []byte("PRIVMSG")) {
-		querier, hostname := extractQH(message)
-
-		switch {
-		case bytes.Contains(message, []byte("\x01PING")):
-			payload := bytes.Split(message, []byte("\x01PING "))[1]
-
-			in.Privmsg(querier, "\x01PONG %sn", payload)
-		case bytes.Contains(message, []byte("\x01VERSION\x01")):
-			in.Privmsg(querier, "\x01VERSION fulminata-v0.0.1\x01")
-			//		case bytes.Contains(message, []byte("\x01WEBSITE\x01")):
-			//			in.Write(fmt.Appendf([]byte{}, "PRIVMSG %v :\x01WEBSITE https://github.com/ina-exter/irc-downloader\x01\n", querier))
-		case bytes.Contains(bytes.ToUpper(message), []byte("DCC SEND")):
-			// Handle DCC message reception
-			// SAFETY: only accept it if it's a private message to us
-			if bytes.Contains(message, fmt.Append([]byte("PRIVMSG "), ic.nickname)) {
-				ic.enqueueDownloadRequest(in, message)
-			}
-		case bytes.Contains(bytes.ToUpper(message), []byte("DCC LIST")):
-			// Handle DCC message reception
-			// SAFETY: only accept it if it's a private message to us
-			if bytes.Contains(message, fmt.Append([]byte("PRIVMSG "), ic.nickname)) {
-				in.Privmsg(querier, "XDCC LIST Denied: too big for irc. Use /msg %s XDCC SEND list", ic.nickname)
-			}
-		case bytes.Contains(bytes.ToUpper(message), []byte("DCC CANCEL")):
-			// Handle DCC message reception
-			// SAFETY: only accept it if it's a private message to us
-			if bytes.Contains(message, fmt.Append([]byte("PRIVMSG "), ic.nickname)) {
-				ic.cancel(hostname)
-			}
-		case bytes.Contains(bytes.ToUpper(message), []byte("DCC RESUME")):
-			// Handle DCC message reception
-			// SAFETY: only accept it if it's a private message to us
-			if bytes.Contains(message, fmt.Append([]byte("PRIVMSG "), ic.nickname)) {
-				ic.resume(in, querier, message)
-			}
-		case bytes.Contains(bytes.ToUpper(message), []byte("DCC")):
-			if bytes.Contains(message, fmt.Append([]byte("PRIVMSG "), ic.nickname)) {
-				in.Privmsg(querier, "Unimplemented DCC action.")
-			}
-		case bytes.Contains(message, []byte("\x01")):
-			in.Privmsg(querier, "Unimplemented CTCP action, don't hesitate to open a github issue (link with CTCP WEBSITE)")
+	switch msg := ifMsg.(type) {
+	case PingMessage:
+		in.Write([]byte("PONG " + string(msg.Payload)))
+	case VerbMsg:
+		if !msg.IsPrivmsgToMe(ic.nickname) {
+			// only direct privmsg supported yet
+			return
 		}
 
-		return
+		payload := strings.Trim(msg.Message, "\x01")
+		// for header purposes
+		upperPayload := strings.ToUpper(payload)
+
+		switch {
+		case strings.HasPrefix(upperPayload, "PING "):
+			data, _ := strings.CutPrefix(payload, "PING ")
+
+			in.Notice(msg.Nick, "\x01PONG %s\x01", data)
+		case strings.HasPrefix(upperPayload, "VERSION"):
+			in.Notice(msg.Nick, "\x01VERSION fulminata-v0.0.1\x01")
+		case strings.HasPrefix(upperPayload, "CLIENTINFO"):
+			in.Notice(msg.Nick, "\x01DCC XDCC WEBSITE CLIENTINFO PING VERSION\x01")
+		case strings.HasPrefix(upperPayload, "WEBSITE"):
+			in.Notice(msg.Nick, "\x01WEBSITE https://github.com/ina-exter/fulminata\x01")
+		case strings.HasPrefix(upperPayload, "SOURCE"):
+			in.Notice(msg.Nick, "\x01SOURCE https://github.com/ina-exter/fulminata\x01")
+		case strings.Contains(upperPayload, "DCC "):
+			ic.handleDCCMessage(in, msg)
+		default:
+			in.Notice(msg.Nick, "Unimplemented CTCP action, don't hesitate to open a github issue (link with CTCP WEBSITE)")
+		}
 	}
 }
 
-func (ic *ircClient) enqueueDownloadRequest(w *ircWriter, message []byte) error {
+var dccRegexp = regexp.MustCompile("((?:S|s)?(?:X|x)?(?:DCC|dcc)) +([^ ]*) ?(.*)")
+
+func (ic *ircClient) handleDCCMessage(in *ircWriter, msg VerbMsg) {
+	matches := dccRegexp.FindStringSubmatch(
+		strings.Trim(msg.Message, "\x01"),
+	)
+
+	if len(matches) < 3 {
+		in.Privmsg(msg.Nick, "Unrecognized DCC action.")
+		return
+	}
+
+	// matches[1] contains (S)(X)DCC
+	// matches[2] is the verb
+
+	switch strings.ToUpper(matches[2]) {
+	case "SEND":
+		ic.send(in, msg)
+	case "LIST":
+		in.Privmsg(msg.Nick, "XDCC LIST Denied: too big for irc. Use /msg %s XDCC SEND list", ic.nickname)
+	case "CANCEL":
+		ic.cancel(msg.Hostname)
+	case "RESUME":
+		ic.resume(in, msg)
+	case "BATCH":
+		ic.batch(in, msg)
+	default:
+		in.Privmsg(msg.Nick, "Unimplemented DCC action.")
+	}
+}
+
+func trimPackName(r rune) bool {
+	return r == '\x01' || r == '#' || r == ' '
+}
+
+func (ic *ircClient) send(w *ircWriter, message VerbMsg) error {
 	req := decodeSend(message)
 
 	if req.Nick == "" || req.Pack == "" {
@@ -198,29 +224,91 @@ func (ic *ircClient) enqueueDownloadRequest(w *ircWriter, message []byte) error 
 
 	// slot check for extra message
 	// remove?
+	ic.enqueueDownloadRequests(w, []downloadRequest{req})
+
+	return nil
+}
+
+func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+
+	nick := reqs[0].Nick
+	hostname := reqs[0].Hostname
+
 	if ic.portsPool.Free() == 0 {
-		w.Privmsg(req.Nick, "Slots are full, please be patient")
+		w.Privmsg(nick, "Slots are full, please be patient")
 	}
 
 	ic.downloadCountMu.Lock()
 
 	defer ic.downloadCountMu.Unlock()
 
-	ic.downloadProcessesByHostname[req.Hostname] = append(
-		ic.downloadProcessesByHostname[req.Hostname],
-		downloadProcess{
-			downloadRequest: req,
-		},
-	)
+	processes := ic.downloadProcessesByHostname[hostname]
+	messageSent := false
 
-	if len(ic.downloadProcessesByHostname[req.Hostname]) > ic.rateLimit {
-		w.Privmsg(req.Nick, "Request queued: you have too many transfer pendings. Please finish or cancel pending transfers.")
-		ic.downloadQueue[req.Hostname] = append(ic.downloadQueue[req.Hostname], req)
-	} else {
-		ic.downloadRequestsChan <- req
+	for _, req := range reqs {
+		processes = append(
+			processes,
+			downloadProcess{
+				downloadRequest: req,
+			},
+		)
+
+		if len(ic.downloadProcessesByHostname[hostname]) > ic.rateLimit {
+			if !messageSent {
+				messageSent = true
+				w.Privmsg(nick, "Request queued: you have too many transfer pendings. Please finish or cancel pending transfers.")
+			}
+
+			ic.downloadQueue[hostname] = append(ic.downloadQueue[hostname], req)
+		} else {
+			ic.downloadRequestsChan <- req
+		}
 	}
 
-	return nil
+	ic.downloadProcessesByHostname[hostname] = processes
+}
+
+func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
+	packNumbersPieces := bytes.Split(
+		bytes.ToUpper([]byte(message.Message)), []byte("DCC BATCH "),
+	)
+
+	if len(packNumbersPieces) < 2 {
+		w.Privmsg(message.Nick, "Invalid batch cmd.")
+
+		return
+	}
+
+	packNumbers := strings.Split(string(packNumbersPieces[1]), ",")
+
+	reqs := make([]downloadRequest, 0, len(packNumbers))
+
+	for _, spn := range packNumbers {
+		packID := strings.TrimFunc(
+			string(spn),
+			trimPackName,
+		)
+
+		if !ic.fileFetcher.Exists(packID) {
+			w.Privmsg(message.Nick, "Pack not found")
+
+			return
+		}
+
+		reqs = append(
+			reqs,
+			downloadRequest{
+				Nick:     message.Nick,
+				Hostname: message.Hostname,
+				Pack:     packID,
+			},
+		)
+	}
+
+	ic.enqueueDownloadRequests(w, reqs)
 }
 
 func (ic *ircClient) cancel(hostname string) {
@@ -255,13 +343,13 @@ func (ic *ircClient) cancel(hostname string) {
 	ic.downloadRequestsChan <- nextReq
 }
 
-func (ic *ircClient) resume(w *ircWriter, querier string, message []byte) {
-	w.Privmsg(querier, "DCC RESUME is experimental, be warned.")
+func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
+	w.Privmsg(message.Nick, "DCC RESUME is experimental, be warned.")
 	dlr, filename, port, readAt := ic.decodeResume(message)
 	fmt.Println("obtained resume request: ", dlr, filename, port, readAt)
 
 	if dlr.Pack == "" || dlr.Nick == "" || filename == "" || readAt == 0 {
-		w.Privmsg(querier, "DCC RESUME request is invalid or was improperly passed, please XDCC CANCEL and try again.")
+		w.Privmsg(message.Nick, "DCC RESUME request is invalid or was improperly passed, please XDCC CANCEL and try again.")
 		return
 	}
 
@@ -516,71 +604,28 @@ func (ic *ircClient) alterProcess(req downloadRequest, callback func(*downloadPr
 	}
 }
 
-func extractQH(message []byte) (string, string) {
-	pieces := bytes.Split(message, []byte(" "))
-
-	if len(pieces) <= 1 {
-		return "", ""
-	}
-
-	nodots := bytes.TrimPrefix(pieces[0], []byte(":"))
-
-	usernameBits := bytes.Split(nodots, []byte("!"))
-
-	if len(usernameBits) < 1 {
-		return "", ""
-	}
-
-	hostnameBits := bytes.Split(nodots, []byte("@"))
-
-	if len(hostnameBits) <= 1 {
-		return "", ""
-	}
-
-	return string(usernameBits[0]), string(hostnameBits[1])
-}
-
-func decodeSend(message []byte) downloadRequest {
+func decodeSend(message VerbMsg) downloadRequest {
 	// :Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND
-	noDots, found := bytes.CutPrefix(message, []byte(":"))
+	packNumberPieces := bytes.Split(
+		bytes.ToUpper([]byte(message.Message)), []byte("DCC SEND "),
+	)
 
-	if !found {
-		return downloadRequest{}
-	}
-
-	username, hostname := extractQH(message)
-
-	if username == "" || hostname == "" {
-		return downloadRequest{}
-	}
-
-	packNumberPieces := bytes.Split(bytes.ToUpper(noDots), []byte("DCC SEND "))
-
-	if len(packNumberPieces) <= 1 {
+	if len(packNumberPieces) < 2 {
 		return downloadRequest{}
 	}
 
 	return downloadRequest{
-		Nick:     string(username),
-		Hostname: string(hostname),
-		Pack:     string(packNumberPieces[1]),
+		Nick:     message.Nick,
+		Hostname: message.Hostname,
+		Pack: strings.TrimFunc(
+			string(packNumberPieces[1]),
+			trimPackName,
+		),
 	}
 }
 
-func (ic *ircClient) decodeResume(message []byte) (downloadRequest, string, int, int) {
-	noDots, found := bytes.CutPrefix(message, []byte(":"))
-
-	if !found {
-		return downloadRequest{}, "", 0, 0
-	}
-
-	username, hostname := extractQH(message)
-
-	if username == "" || hostname == "" {
-		return downloadRequest{}, "", 0, 0
-	}
-
-	resumeDataPieces := bytes.Split(noDots, []byte("DCC RESUME "))
+func (ic *ircClient) decodeResume(message VerbMsg) (downloadRequest, string, int, int) {
+	resumeDataPieces := bytes.Split([]byte(message.Message), []byte("DCC RESUME "))
 
 	if len(resumeDataPieces) <= 1 {
 		return downloadRequest{}, "", 0, 0
@@ -619,8 +664,8 @@ func (ic *ircClient) decodeResume(message []byte) (downloadRequest, string, int,
 	}
 
 	return downloadRequest{
-		Nick:     string(username),
-		Hostname: string(hostname),
+		Nick:     message.Nick,
+		Hostname: message.Hostname,
 		Pack:     packID,
 	}, filename, port, readAt
 }
@@ -664,7 +709,8 @@ type ircClient struct {
 	// stores requests by clients, they will be processed when a slot is free, key is hostname
 	downloadQueue map[string][]downloadRequest
 
-	shutdownChan chan struct{}
+	shutdownChans map[string]chan struct{}
+	errChan       chan error
 }
 
 func ip2int(ip net.IP) uint32 {
@@ -674,8 +720,6 @@ func ip2int(ip net.IP) uint32 {
 
 	return binary.BigEndian.Uint32(ip)
 }
-
-var rootSavePath = getEnvFallback("ROOT_FOLDER", "/anime")
 
 func getEnvFallback(key, def string) string {
 	val, ok := os.LookupEnv(key)
@@ -720,13 +764,15 @@ func mustExtractIP() uint32 {
 }
 
 func main() {
-	fsAccess := os.DirFS(rootSavePath)
-	lookupID, lookupPack := mustBuildLookups(fsAccess)
-
 	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "")
+	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime")
 	joinChan := getEnvFallback("CHANNEL", "#exter-periment")
 	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68")
 	portsStr := strings.Split(getEnvFallback("PORTS", "38542,38543"), ",")
+	nick := getEnvFallback("NICK", "Fulminata|Experiment")
+
+	fsAccess := os.DirFS(rootSavePath)
+	lookupID, lookupPack := mustBuildLookups(fsAccess)
 
 	ports := make([]int, 0, len(portsStr))
 
@@ -738,8 +784,8 @@ func main() {
 
 	pool := newPortsPool(ports)
 
-	c := ircClient{
-		nickname:                    "Fulminata|Experiment",
+	ic := ircClient{
+		nickname:                    nick,
 		registrationPassword:        registrationPassword,
 		channel:                     joinChan,
 		localIP:                     localIP,
@@ -749,6 +795,11 @@ func main() {
 		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
 		downloadRequestsChan:        make(chan downloadRequest, 65535),
 		downloadQueue:               make(map[string][]downloadRequest, 65535),
+		errChan:                     make(chan error, 10),
+		shutdownChans: map[string]chan struct{}{
+			"dcc": make(chan struct{}),
+			"irc": make(chan struct{}),
+		},
 		fileFetcher: fsHandler{
 			fsAccess:   fsAccess,
 			pool:       pool,
@@ -759,14 +810,24 @@ func main() {
 
 	reportingTicker := time.NewTicker(time.Minute)
 
-	c.connect()
+	ic.connect()
 
 	for {
-		<-reportingTicker.C
-		fmt.Println("Open ports: ", slices.Collect(maps.Keys(c.portsPool.openPorts)))
-		fmt.Println("Requests by hostname:")
-		for hn, reqs := range c.downloadProcessesByHostname {
-			fmt.Println(hn, reqs)
+		select {
+		case <-reportingTicker.C:
+			fmt.Println("Open ports: ", slices.Collect(maps.Keys(ic.portsPool.openPorts)))
+			fmt.Println("Requests by hostname:")
+			for hn, reqs := range ic.downloadProcessesByHostname {
+				fmt.Println(hn, reqs)
+			}
+		case err := <-ic.errChan:
+			fmt.Println("fatal error received:", err)
+
+			for _, c := range ic.shutdownChans {
+				c <- struct{}{}
+			}
+
+			return
 		}
 	}
 }

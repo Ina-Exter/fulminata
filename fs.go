@@ -96,6 +96,8 @@ type fsHandler struct {
 }
 
 func (fh fsHandler) Exists(packID string) bool {
+	packID = trimPackID(packID)
+
 	if strings.ToLower(packID) == listPack {
 		return true
 	}
@@ -105,8 +107,17 @@ func (fh fsHandler) Exists(packID string) bool {
 	return ok
 }
 
+func trimPackID(id string) string {
+	return strings.TrimFunc(
+		id,
+		func(r rune) bool {
+			return r == '\x01' || r == '#' || r == ' '
+		},
+	)
+}
+
 func (fh fsHandler) Get(packID string) (fs.File, error) {
-	packID = strings.TrimPrefix(packID, "#")
+	packID = trimPackID(packID)
 
 	if strings.ToLower(packID) == listPack {
 		return fh.list()

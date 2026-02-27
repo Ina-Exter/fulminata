@@ -6,6 +6,62 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestDecodeSend(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		haveMsg  []byte
+		wantNick string
+		wantHost string
+		wantPack string
+	}{
+		{
+			name:     "with sharp",
+			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND #1\x01"),
+			wantNick: "Exterminata",
+			wantHost: "AFC539C.716A7309.A137196A.IP",
+			wantPack: "1",
+		},
+		{
+			name:     "without sharp",
+			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND 1\x01"),
+			wantNick: "Exterminata",
+			wantHost: "AFC539C.716A7309.A137196A.IP",
+			wantPack: "1",
+		},
+		{
+			name:     "without x01 headers",
+			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND 1"),
+			wantNick: "Exterminata",
+			wantHost: "AFC539C.716A7309.A137196A.IP",
+			wantPack: "1",
+		},
+		{
+			name:     "with DCC",
+			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01DCC SEND #1\x01"),
+			wantNick: "Exterminata",
+			wantHost: "AFC539C.716A7309.A137196A.IP",
+			wantPack: "1",
+		},
+		{
+			name:     "with SXDCC",
+			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01SXDCC SEND #10\x01"),
+			wantNick: "Exterminata",
+			wantHost: "AFC539C.716A7309.A137196A.IP",
+			wantPack: "10",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := Parse(tt.haveMsg)
+
+			req := decodeSend(msg.(VerbMsg))
+
+			assert.Equal(t, tt.wantNick, req.Nick)
+			assert.Equal(t, tt.wantHost, req.Hostname)
+			assert.Equal(t, tt.wantPack, req.Pack)
+		})
+	}
+}
+
 func TestIRCClient_DecodeResume(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
@@ -47,7 +103,9 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 				},
 			}
 
-			req, filename, port, readAt := ic.decodeResume(tt.haveMsg)
+			msg := Parse(tt.haveMsg)
+
+			req, filename, port, readAt := ic.decodeResume(msg.(VerbMsg))
 
 			assert.Equal(t, tt.wantNick, req.Nick)
 			assert.Equal(t, tt.wantHost, req.Hostname)

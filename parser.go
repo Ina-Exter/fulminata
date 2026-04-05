@@ -6,7 +6,25 @@ import (
 	"regexp"
 )
 
-var verbMsgRegex = regexp.MustCompile("@?[^ ]* ?:(.*)!(.*)@([^ !]*) ([^ ]*) ([^ ]*) :?(.*)")
+/*
+	This follows the pattern of:
+
+- optional @ (tags) and tags
+- :
+- optional sender nick (group 1)
+- !
+- optional sender username (group 2)
+- sender hostname or service name (group 3)
+- if there is only a hostname, replace groups 1 and 2 by :
+- space
+- verb (or number) (group 4)
+- space
+- target nick (group 5)
+- space
+- :
+- payload (group 6)
+*/
+var verbMsgRegex = regexp.MustCompile("(?:(?:@?[^ ]* ?:(.*)!(.*)@)|:)?([^ !]*) ([^ ]*) ([^ ]*) :?(.*)")
 
 type IRCMessage interface {
 	Raw() []byte
@@ -46,6 +64,10 @@ func (vm VerbMsg) Raw() []byte {
 
 func (vm VerbMsg) IsPrivmsgToMe(me string) bool {
 	return vm.Verb == "PRIVMSG" && vm.To == me
+}
+
+func (vm VerbMsg) SystemMessage() bool {
+	return vm.Nick == "" && vm.User == ""
 }
 
 func (pm PingMessage) Raw() []byte { return fmt.Appendf([]byte{}, "PING %s", pm.Payload) }

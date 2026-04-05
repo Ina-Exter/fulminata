@@ -54,9 +54,14 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
-			name:    "raw",
-			haveMsg: []byte(":irc.uworld.se 001 ayayaya :Welcome to the Rizon Internet Relay Chat Network ayayaya"),
-			wantMsg: RawMessage{raw: []byte(":irc.uworld.se 001 ayayaya :Welcome to the Rizon Internet Relay Chat Network ayayaya")},
+			name:    "verb message without sender",
+			haveMsg: []byte(":irc.uworld.se 001 ayaya :Welcome to the Rizon Internet Relay Chat Network ayaya"),
+			wantMsg: VerbMsg{
+				Hostname: "irc.uworld.se",
+				Verb:     "001",
+				To:       "ayaya",
+				Message:  "Welcome to the Rizon Internet Relay Chat Network ayaya",
+			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

@@ -53,6 +53,7 @@ func (ircw *ircWriter) Notice(to, format string, args ...any) (int, error) {
 func (ic *ircClient) connect() error {
 	fmt.Println("client connecting")
 
+	// 6667 for tcp, 6697 for tls over tcp
 	conn, err := tls.Dial("tcp", "irc.rizon.net:6697", nil)
 
 	if err != nil {
@@ -79,34 +80,6 @@ func (ic *ircClient) connect() error {
 	in := &ircWriter{&writeFlusher{w: conn}}
 	in.Write(fmt.Appendf([]byte{}, "USER fulminata * 0 :%s\n", ic.nickname))
 	in.Write(fmt.Appendf([]byte{}, "NICK %s\n", ic.nickname))
-
-	// channel handshake loop (must be synchronous)
-	for message := range messageChan {
-		// first ping
-		if ts, ok := bytes.CutPrefix(message, []byte("PING")); ok {
-			in.Write([]byte("PONG" + string(ts) + "\n"))
-		}
-
-		// MOTD finished: join now
-		if bytes.Contains(message, []byte("End of /MOTD command.")) {
-			// nick registration
-			if ic.registrationPassword != "" {
-				in.Privmsg("NickServ", "IDENTIFY %s", ic.registrationPassword)
-			}
-			// leave time for roundtrip
-			time.Sleep(time.Second)
-
-			fmt.Println("send join")
-			in.Write(fmt.Appendf([]byte{}, "JOIN %s\n", ic.channel))
-
-			break
-		}
-
-		// received NAMES list end: ok, we're connected to the chan, break out of handshake loop
-		if bytes.Contains(message, []byte("End of /NAMES list")) {
-			break
-		}
-	}
 
 	// irc side background handler loop
 	go func() {
@@ -144,33 +117,62 @@ func (ic *ircClient) ircMessageHandler(in *ircWriter, message []byte) {
 	case PingMessage:
 		in.Write([]byte("PONG " + string(msg.Payload)))
 	case VerbMsg:
+		if msg.SystemMessage() {
+			ic.handleSystemMessage(in, msg)
+
+			return
+		}
+
 		if !msg.IsPrivmsgToMe(ic.nickname) {
 			// only direct privmsg supported yet
 			return
 		}
 
-		payload := strings.Trim(msg.Message, "\x01")
-		// for header purposes
-		upperPayload := strings.ToUpper(payload)
+		ic.handlePrivMsg(in, msg)
+	}
+}
 
-		switch {
-		case strings.HasPrefix(upperPayload, "PING "):
-			data, _ := strings.CutPrefix(payload, "PING ")
+func (ic *ircClient) handleSystemMessage(in *ircWriter, msg VerbMsg) {
+	// MOTD finished: join now
+	if bytes.Contains([]byte(msg.Message), []byte("End of /MOTD command.")) {
+		if !ic.handshakeAndJoinCompleted {
+			// nick registration
+			if ic.registrationPassword != "" {
+				in.Privmsg("NickServ", "IDENTIFY %s", ic.registrationPassword)
+			}
+			// leave time for roundtrip
+			time.Sleep(time.Second)
 
-			in.Notice(msg.Nick, "\x01PONG %s\x01", data)
-		case strings.HasPrefix(upperPayload, "VERSION"):
-			in.Notice(msg.Nick, "\x01VERSION fulminata-v0.0.1\x01")
-		case strings.HasPrefix(upperPayload, "CLIENTINFO"):
-			in.Notice(msg.Nick, "\x01DCC XDCC WEBSITE CLIENTINFO PING VERSION\x01")
-		case strings.HasPrefix(upperPayload, "WEBSITE"):
-			in.Notice(msg.Nick, "\x01WEBSITE https://github.com/ina-exter/fulminata\x01")
-		case strings.HasPrefix(upperPayload, "SOURCE"):
-			in.Notice(msg.Nick, "\x01SOURCE https://github.com/ina-exter/fulminata\x01")
-		case strings.Contains(upperPayload, "DCC "):
-			ic.handleDCCMessage(in, msg)
-		default:
-			in.Notice(msg.Nick, "Unimplemented CTCP action, don't hesitate to open a github issue (link with CTCP WEBSITE)")
+			fmt.Println("send join")
+			in.Write(fmt.Appendf([]byte{}, "JOIN %s\n", ic.channel))
+
+			ic.handshakeAndJoinCompleted = true
 		}
+	}
+}
+
+func (ic *ircClient) handlePrivMsg(in *ircWriter, msg VerbMsg) {
+	payload := strings.Trim(msg.Message, "\x01")
+	// for header purposes
+	upperPayload := strings.ToUpper(payload)
+
+	switch {
+	case strings.HasPrefix(upperPayload, "PING "):
+		data, _ := strings.CutPrefix(payload, "PING ")
+
+		in.Notice(msg.Nick, "\x01PONG %s\x01", data)
+	case strings.HasPrefix(upperPayload, "VERSION"):
+		in.Notice(msg.Nick, "\x01VERSION fulminata-v0.0.1\x01")
+	case strings.HasPrefix(upperPayload, "CLIENTINFO"):
+		in.Notice(msg.Nick, "\x01DCC XDCC WEBSITE CLIENTINFO PING VERSION\x01")
+	case strings.HasPrefix(upperPayload, "WEBSITE"):
+		in.Notice(msg.Nick, "\x01WEBSITE https://github.com/ina-exter/fulminata\x01")
+	case strings.HasPrefix(upperPayload, "SOURCE"):
+		in.Notice(msg.Nick, "\x01SOURCE https://github.com/ina-exter/fulminata\x01")
+	case strings.Contains(upperPayload, "DCC "):
+		ic.handleDCCMessage(in, msg)
+	default:
+		in.Notice(msg.Nick, "Unimplemented CTCP action, don't hesitate to open a github issue (link with CTCP WEBSITE)")
 	}
 }
 
@@ -687,12 +689,13 @@ type downloadProcess struct {
 type ircClient struct {
 	fileFetcher fsHandler
 
-	connMutex            sync.Mutex
-	nickname             string
-	registrationPassword string
-	channel              string
-	myIP                 uint32
-	localIP              string
+	connMutex                 sync.Mutex
+	nickname                  string
+	registrationPassword      string
+	channel                   string
+	myIP                      uint32
+	localIP                   string
+	handshakeAndJoinCompleted bool
 
 	// channel stores requests by clients, they will be processed when a slot is free
 	downloadRequestsChan chan downloadRequest

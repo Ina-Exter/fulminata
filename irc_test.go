@@ -96,7 +96,7 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ic := &ircClient{
-				fileFetcher: fsHandler{
+				fileFetcher: &fsHandler{
 					lookupID: map[string]PackInfo{
 						"1": {Name: "[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv"},
 					},

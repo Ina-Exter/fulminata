@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,7 +74,7 @@ func main() {
 	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68")
 	portsStr := strings.Split(getEnvFallback("PORTS", "38542,38543"), ",")
 	nick := getEnvFallback("NICK", "Fulminata|Experiment")
-	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", "downloads_count.json")
+	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"))
 
 	ports := make([]int, 0, len(portsStr))
 

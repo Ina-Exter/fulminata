@@ -10,7 +10,6 @@ import (
 	"maps"
 	"math"
 	"os"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,7 +37,6 @@ type fsHandler struct {
 
 	// count
 	countBuffer               map[string]int
-	rootSavePath              string
 	downloadsCountBackingFile string
 }
 
@@ -52,7 +50,6 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 		lookupID:                  lookupID,
 		lookupPack:                lookupPack,
 		countBuffer:               make(map[string]int),
-		rootSavePath:              rootSavePath,
 		downloadsCountBackingFile: counterFile,
 	}
 
@@ -60,7 +57,7 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 		panic(err)
 	}
 
-	persistanceTicker := time.NewTicker(1 * time.Minute)
+	persistanceTicker := time.NewTicker(4 * time.Minute)
 
 	go func() {
 		for {
@@ -68,6 +65,8 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 			case <-persistanceTicker.C:
 				if err := fh.persistCounts(); err != nil {
 					fmt.Println(err)
+				} else {
+					fmt.Println("persisted counts")
 				}
 			}
 		}
@@ -235,7 +234,7 @@ func (fh *fsHandler) list() (fs.File, error) {
 }
 
 func (fh *fsHandler) loadCounts() error {
-	countFile, err := os.Open(path.Join(fh.rootSavePath, fh.downloadsCountBackingFile))
+	countFile, err := os.Open(fh.downloadsCountBackingFile)
 
 	defer countFile.Close()
 
@@ -255,7 +254,7 @@ func (fh *fsHandler) loadCounts() error {
 }
 
 func (fh *fsHandler) persistCounts() error {
-	countFile, err := os.OpenFile(path.Join(fh.rootSavePath, fh.downloadsCountBackingFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+	countFile, err := os.OpenFile(fh.downloadsCountBackingFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
 
 	defer countFile.Close()
 

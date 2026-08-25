@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,7 @@ type fsHandler struct {
 	lookupPack map[PackInfo]string
 
 	// count
+	countBufferMu             sync.Mutex
 	countBuffer               map[string]int
 	downloadsCountBackingFile string
 }
@@ -181,7 +183,9 @@ func (fh *fsHandler) Get(packID string) (fs.File, error) {
 		return nil, ErrNotFound
 	}
 
+	fh.countBufferMu.Lock()
 	fh.countBuffer[packPath]++
+	fh.countBufferMu.Unlock()
 
 	return fh.fsAccess.Open(packPath)
 }
@@ -215,6 +219,9 @@ func (fh *fsHandler) list() (fs.File, error) {
 	b.Write([]byte("** Fulminata is an experimental bot I wrote myself, please expect some weird stuff **\n"))
 	b.Write(fmt.Appendf([]byte{}, "** %d packs, %d of %d slots open **\n", len(infos), fh.pool.Free(), fh.pool.Total()))
 
+	fh.countBufferMu.Lock()
+	defer fh.countBufferMu.Unlock()
+
 	for _, pack := range infos {
 		path := fh.lookupPack[pack]
 		count := fh.countBuffer[path]
@@ -236,11 +243,17 @@ func (fh *fsHandler) list() (fs.File, error) {
 func (fh *fsHandler) loadCounts() error {
 	countFile, err := os.Open(fh.downloadsCountBackingFile)
 
-	defer countFile.Close()
+	switch {
+	case err == nil:
+	case os.IsNotExist(err):
+		fh.countBuffer = make(map[string]int)
 
-	if err != nil {
+		return nil
+	default:
 		return err
 	}
+
+	defer countFile.Close()
 
 	var counts map[string]int
 
@@ -248,13 +261,19 @@ func (fh *fsHandler) loadCounts() error {
 		return err
 	}
 
+	fh.countBufferMu.Lock()
 	fh.countBuffer = counts
+	fh.countBufferMu.Unlock()
 
 	return nil
 }
 
 func (fh *fsHandler) persistCounts() error {
-	countFile, err := os.OpenFile(fh.downloadsCountBackingFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+	fh.countBufferMu.Lock()
+	snapshot := maps.Clone(fh.countBuffer)
+	fh.countBufferMu.Unlock()
+
+	countFile, err := os.OpenFile(fh.downloadsCountBackingFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 
 	defer countFile.Close()
 
@@ -262,7 +281,7 @@ func (fh *fsHandler) persistCounts() error {
 		return err
 	}
 
-	return json.NewEncoder(countFile).Encode(fh.countBuffer)
+	return json.NewEncoder(countFile).Encode(snapshot)
 }
 
 func format(s int64) string {

@@ -24,7 +24,7 @@ import (
 - :
 - payload (group 6)
 */
-var verbMsgRegex = regexp.MustCompile("(?:(?:@?[^ ]* ?:(.*)!(.*)@)|:)?([^ !]*) ([^ ]*) ([^ ]*) :?(.*)")
+var verbMsgRegex = regexp.MustCompile("(?:(?:@?[^ ]* ?:(.*)!(.*)@)|:)?([^ !]*) +([^ ]*) +([^ ]*) +:?(.*)")
 
 type IRCMessage interface {
 	Raw() []byte

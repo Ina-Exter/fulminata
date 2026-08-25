@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -52,6 +54,10 @@ func mustExtractIP() uint32 {
 
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		panic(fmt.Sprintf("invalid status code for ip discovery: %d", resp.StatusCode))
+	}
+
 	strIP, err := io.ReadAll(resp.Body)
 
 	if err != nil {
@@ -67,6 +73,35 @@ func mustExtractIP() uint32 {
 	return ip2int(ip)
 }
 
+func spinTLSConfig() ([]tls.Certificate, error) {
+	tlsCertPath := getEnvFallback("TLS_CERT_PATH", "")
+	tlsKeyPath := getEnvFallback("TLS_KEY_PATH", "")
+
+	if tlsCertPath == "" || tlsKeyPath == "" {
+		return nil, errors.New("no certificate paths provided")
+	}
+
+	certData, err := os.ReadFile(tlsCertPath)
+
+	if err != nil {
+		return nil, err
+	}
+
+	keyData, err := os.ReadFile(tlsKeyPath)
+
+	if err != nil {
+		return nil, err
+	}
+
+	cert, err := tls.X509KeyPair(certData, keyData)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return []tls.Certificate{cert}, nil
+}
+
 func main() {
 	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "")
 	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime")
@@ -76,10 +111,20 @@ func main() {
 	nick := getEnvFallback("NICK", "Fulminata|Experiment")
 	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"))
 
+	certs, err := spinTLSConfig()
+
+	if err != nil {
+		fmt.Println("cannot get tls certificate:", err, ", bot starting without SDCC capabilities")
+	}
+
 	ports := make([]int, 0, len(portsStr))
 
 	for _, ps := range portsStr {
-		pint, _ := strconv.Atoi(ps)
+		pint, err := strconv.Atoi(ps)
+
+		if err != nil || pint == 0 {
+			panic("invalid port" + ps + ":" + err.Error())
+		}
 
 		ports = append(ports, pint)
 	}
@@ -89,11 +134,14 @@ func main() {
 	fsHandler := MustNewFSHandler(rootSavePath, counterFile, pool)
 
 	ic := ircClient{
-		nickname:                    nick,
-		registrationPassword:        registrationPassword,
-		channel:                     joinChan,
-		localIP:                     localIP,
-		myIP:                        mustExtractIP(),
+		nickname:             nick,
+		registrationPassword: registrationPassword,
+		channel:              joinChan,
+		listenerBuilderFactory: listenerBuilderFactory{
+			localIP:      localIP,
+			externalIP:   mustExtractIP(),
+			certificates: certs,
+		},
 		portsPool:                   pool,
 		rateLimit:                   1,
 		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
@@ -116,7 +164,12 @@ func main() {
 		case <-reportingTicker.C:
 			fmt.Println("Open ports: ", slices.Collect(maps.Keys(ic.portsPool.openPorts)))
 			fmt.Println("Requests by hostname:")
-			for hn, reqs := range ic.downloadProcessesByHostname {
+
+			ic.downloadCountMu.Lock()
+			snapshot := maps.Clone(ic.downloadProcessesByHostname)
+			ic.downloadCountMu.Unlock()
+
+			for hn, reqs := range snapshot {
 				fmt.Println(hn, reqs)
 			}
 		case err := <-ic.errChan:

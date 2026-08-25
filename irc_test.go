@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,46 +9,84 @@ import (
 
 func TestDecodeSend(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		haveMsg  []byte
-		wantNick string
-		wantHost string
-		wantPack string
+		name         string
+		haveMsg      []byte
+		wantNick     string
+		wantHost     string
+		wantPack     string
+		wantProtocol Protocol
 	}{
 		{
-			name:     "with sharp",
-			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND #1\x01"),
-			wantNick: "Exterminata",
-			wantHost: "AFC539C.716A7309.A137196A.IP",
-			wantPack: "1",
+			name:         "with sharp",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: XDCC,
 		},
 		{
-			name:     "without sharp",
-			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND 1\x01"),
-			wantNick: "Exterminata",
-			wantHost: "AFC539C.716A7309.A137196A.IP",
-			wantPack: "1",
+			name:         "without sharp",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SEND 1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: XDCC,
 		},
 		{
-			name:     "without x01 headers",
-			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND 1"),
-			wantNick: "Exterminata",
-			wantHost: "AFC539C.716A7309.A137196A.IP",
-			wantPack: "1",
+			name:         "without x01 headers",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND 1"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: XDCC,
 		},
 		{
-			name:     "with DCC",
-			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01DCC SEND #1\x01"),
-			wantNick: "Exterminata",
-			wantHost: "AFC539C.716A7309.A137196A.IP",
-			wantPack: "1",
+			name:         "with DCC",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01DCC SEND #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: DCC,
 		},
 		{
-			name:     "with SXDCC",
-			haveMsg:  []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01SXDCC SEND #10\x01"),
-			wantNick: "Exterminata",
-			wantHost: "AFC539C.716A7309.A137196A.IP",
-			wantPack: "10",
+			name:         "with SDCC",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01SDCC SEND #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: SDCC,
+		},
+		{
+			name:         "DCC SSEND parsed as SDCC SEND",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01DCC SSEND #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: SDCC,
+		},
+		{
+			name:         "XDCC SSEND parsed as SDCC SEND",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01XDCC SSEND #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: SDCC,
+		},
+		{
+			name:         "with SXDCC",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :\x01SXDCC SEND #10\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "10",
+			wantProtocol: SXDCC,
+		},
+		{
+			name:         "with extra spaces",
+			haveMsg:      []byte(":Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP    PRIVMSG    Fulminata|Experiment   :\x01DCC   SEND   #1\x01"),
+			wantNick:     "Exterminata",
+			wantHost:     "AFC539C.716A7309.A137196A.IP",
+			wantPack:     "1",
+			wantProtocol: DCC,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -58,6 +97,7 @@ func TestDecodeSend(t *testing.T) {
 			assert.Equal(t, tt.wantNick, req.Nick)
 			assert.Equal(t, tt.wantHost, req.Hostname)
 			assert.Equal(t, tt.wantPack, req.Pack)
+			assert.Equal(t, tt.wantProtocol, req.Protocol)
 		})
 	}
 }
@@ -113,6 +153,52 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 			assert.Equal(t, tt.wantFilename, filename)
 			assert.Equal(t, tt.wantPort, port)
 			assert.Equal(t, tt.wantReadAt, readAt)
+		})
+	}
+}
+
+func TestDCCRegexp(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		haveMsg   string
+		wantProto string
+		wantVerb  string
+	}{
+		{
+			name:      "xdcc send, caps",
+			haveMsg:   "XDCC SEND #1",
+			wantProto: "XDCC",
+			wantVerb:  "SEND",
+		},
+		{
+			name:      "dcc send, caps",
+			haveMsg:   "DCC SEND #1",
+			wantProto: "DCC",
+			wantVerb:  "SEND",
+		},
+		{
+			name:      "dcc list, no caps",
+			haveMsg:   "dcc list",
+			wantProto: "DCC",
+			wantVerb:  "LIST",
+		},
+		{
+			name:      "xdcc list, no caps",
+			haveMsg:   "xdcc list",
+			wantProto: "XDCC",
+			wantVerb:  "LIST",
+		},
+		{
+			name:      "dcc cancel, mixed caps",
+			haveMsg:   "DCC cAnCEl",
+			wantProto: "DCC",
+			wantVerb:  "CANCEL",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := dccRegexp.FindStringSubmatch(tt.haveMsg)
+			assert.Equal(t, tt.wantProto, strings.ToUpper(matches[1]))
+			assert.Equal(t, tt.wantVerb, strings.ToUpper(matches[2]))
 		})
 	}
 }

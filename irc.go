@@ -8,17 +8,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
+type Protocol string
+type Verb string
+
+const (
+	DCC   Protocol = "DCC"
+	XDCC  Protocol = "XDCC"
+	SDCC  Protocol = "SDCC"
+	SXDCC Protocol = "SXDCC"
+)
+
 type downloadRequest struct {
+	Protocol Protocol
 	Nick     string
 	Hostname string
 	Pack     string
@@ -38,9 +46,9 @@ type ircClient struct {
 	nickname                  string
 	registrationPassword      string
 	channel                   string
-	myIP                      uint32
-	localIP                   string
 	handshakeAndJoinCompleted bool
+
+	listenerBuilderFactory listenerBuilderFactory
 
 	// channel stores requests by clients, they will be processed when a slot is free
 	downloadRequestsChan chan downloadRequest
@@ -210,7 +218,7 @@ func (ic *ircClient) handlePrivMsg(in *ircWriter, msg VerbMsg) {
 	}
 }
 
-var dccRegexp = regexp.MustCompile("((?:S|s)?(?:X|x)?(?:DCC|dcc)) +([^ ]*) ?(.*)")
+var dccRegexp = regexp.MustCompile("((?:S|s)?(?:X|x)?(?:DCC|dcc)) +([^ ]*) *(.*)")
 
 func (ic *ircClient) handleDCCMessage(in *ircWriter, msg VerbMsg) {
 	matches := dccRegexp.FindStringSubmatch(
@@ -226,7 +234,7 @@ func (ic *ircClient) handleDCCMessage(in *ircWriter, msg VerbMsg) {
 	// matches[2] is the verb
 
 	switch strings.ToUpper(matches[2]) {
-	case "SEND":
+	case "SEND", "SSEND":
 		ic.send(in, msg)
 	case "LIST":
 		in.Privmsg(msg.Nick, "XDCC LIST Denied: too big for irc. Use /msg %s XDCC SEND list", ic.nickname)
@@ -292,7 +300,7 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 			},
 		)
 
-		if len(ic.downloadProcessesByHostname[hostname]) > ic.rateLimit {
+		if len(processes) > ic.rateLimit {
 			if !messageSent {
 				messageSent = true
 				w.Privmsg(nick, "Request queued: you have too many transfer pendings. Please finish or cancel pending transfers.")
@@ -384,7 +392,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 	dlr, filename, port, readAt := ic.decodeResume(message)
 	fmt.Println("obtained resume request: ", dlr, filename, port, readAt)
 
-	if dlr.Pack == "" || dlr.Nick == "" || filename == "" || readAt == 0 {
+	if dlr.Pack == "" || dlr.Nick == "" || filename == "" || readAt <= 0 {
 		w.Privmsg(message.Nick, "DCC RESUME request is invalid or was improperly passed, please XDCC CANCEL and try again.")
 		return
 	}
@@ -393,8 +401,9 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 
 	requests := ic.downloadProcessesByHostname[dlr.Hostname]
 
+	found := false
+
 	if len(requests) > 0 {
-		found := false
 		index := 0
 		process := downloadProcess{}
 
@@ -418,6 +427,12 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		}
 	}
 
+	if !found {
+		w.Privmsg(dlr.Nick, "No request matches RESUME request.")
+
+		return
+	}
+
 	ic.downloadCountMu.Unlock()
 
 	// send accept
@@ -435,7 +450,7 @@ func (ic *ircClient) dequeue(hostname string, request downloadRequest) {
 		newProcesses := make([]downloadProcess, 0, len(processes)-1)
 
 		for _, p := range processes {
-			if p.downloadRequest.Pack == request.Pack && once {
+			if p.downloadRequest.Pack == request.Pack && p.downloadRequest.Nick == request.Nick && once {
 				once = false
 				continue
 			}
@@ -498,26 +513,17 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) e
 
 	port := ic.portsPool.Take()
 
+	listenerBuilder := ic.listenerBuilderFactory.build(req.Protocol, port)
+
 	ctx, cancelContext := context.WithTimeout(context.Background(), defaultTimeout)
 
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			log.Printf("listening on network %v, address %v\n", network, address)
-
-			return nil
-		},
-	}
-
-	listener, err := lc.Listen(ctx, "tcp", fmt.Sprintf("%v:%v", ic.localIP, port))
+	listener, err := listenerBuilder.listener(ctx)
 
 	if err != nil {
 		cancelContext()
+		f.Close()
 
 		return err
-	}
-
-	if l, ok := listener.(*net.TCPListener); ok {
-		l.SetDeadline(time.Now().Add(defaultTimeout))
 	}
 
 	ic.alterProcess(
@@ -539,11 +545,6 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) e
 	go func(ctx context.Context) {
 		defer func() {
 			if err := recover(); err != nil {
-				if strErr, ok := err.(string); ok && strings.Contains(strErr, "transfer reaped") {
-					fmt.Println("transfer reaped")
-
-					return
-				}
 				fmt.Println("panicked during dcc serve: ", err)
 			}
 		}()
@@ -552,9 +553,26 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) e
 		defer cancelContext()
 		defer listener.Close()
 
-		w.Privmsg(req.Nick, "\x01DCC SEND \"%v\" %d %d %d\x01", stats.Name(), ic.myIP, port, stats.Size())
+		if _, err := listenerBuilder.advertise(w, req.Nick, stats); err != nil {
+			panic(err)
+		}
 
 		conn, err := listener.Accept()
+
+		if err != nil {
+			fmt.Printf("accept fucked up with error %v\n", err.Error())
+
+			return
+		}
+
+		cleanup := func() {
+			ic.portsPool.Give(port)
+			ic.dequeue(req.Hostname, req)
+			cancelContext()
+			conn.Close()
+			listener.Close()
+			f.Close()
+		}
 
 		var offset int64 = 0
 
@@ -569,29 +587,30 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) e
 			},
 		)
 
-		// "reaper"
-		defer func() {
-			time.Sleep(time.Minute * 60)
-			ic.portsPool.Give(port)
-			ic.dequeue(req.Hostname, req)
-			cancelContext()
-			conn.Close()
-			listener.Close()
-			panic("transfer reaped")
-		}()
-
-		if err != nil {
-			fmt.Printf("accept fucked up with error %v\n", err.Error())
+		if offset >= stats.Size() {
+			w.Privmsg(req.Nick, "Invalid offset requested")
+			cleanup()
 
 			return
 		}
 
+		// "reaper"
+		timer := time.AfterFunc(time.Minute*60, cleanup)
+		defer timer.Stop()
+
 		fmt.Println("sending with offset", offset, "and bound", stats.Size()-req.offset)
+
+		fAt, ok := f.(io.ReaderAt)
+
+		if !ok {
+			panic(fmt.Sprintf("file %v does not implement ReaderAt", stats.Name()))
+		}
+
 		transferred, err := io.Copy(
 			conn,
 			&contextReader{
 				ctx: ctx,
-				r:   io.NewSectionReader(f.(io.ReaderAt), offset, stats.Size()-req.offset),
+				r:   io.NewSectionReader(fAt, offset, stats.Size()-offset),
 			},
 		)
 
@@ -602,10 +621,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) e
 		}
 
 		time.Sleep(time.Second * 2)
-		listener.Close()
-		conn.Close()
-		ic.dequeue(req.Hostname, req)
-		ic.portsPool.Give(port)
+		cleanup()
 
 		w.Privmsg(req.Nick, "This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.")
 	}(ctx)
@@ -638,20 +654,29 @@ func (ic *ircClient) alterProcess(req downloadRequest, callback func(*downloadPr
 }
 
 func decodeSend(message VerbMsg) downloadRequest {
-	// :Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND
-	packNumberPieces := bytes.Split(
-		bytes.ToUpper([]byte(message.Message)), []byte("DCC SEND "),
+	// :Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND #5
+	packNumberPieces := strings.Fields(
+		strings.ToUpper(
+			strings.Trim(message.Message, "\x01"),
+		),
 	)
 
-	if len(packNumberPieces) < 2 {
+	if len(packNumberPieces) < 3 {
 		return downloadRequest{}
 	}
 
+	proto := Protocol(packNumberPieces[0])
+
+	if strings.ToUpper(packNumberPieces[1]) == "SSEND" {
+		proto = SDCC
+	}
+
 	return downloadRequest{
+		Protocol: proto,
 		Nick:     message.Nick,
 		Hostname: message.Hostname,
 		Pack: strings.TrimFunc(
-			string(packNumberPieces[1]),
+			string(packNumberPieces[2]),
 			trimPackName,
 		),
 	}
@@ -689,7 +714,6 @@ func (ic *ircClient) decodeResume(message VerbMsg) (downloadRequest, string, int
 		return downloadRequest{}, "", 0, 0
 	}
 
-	fmt.Println("lookup filename ", filename)
 	packID, err := ic.fileFetcher.Lookup(filename)
 
 	if err != nil {

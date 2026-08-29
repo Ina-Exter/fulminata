@@ -1,6 +1,8 @@
 package main
 
 import (
+	"maps"
+	"slices"
 	"sync"
 )
 
@@ -22,7 +24,7 @@ func newPortsPool(ports []int) *portsPool {
 
 	return &portsPool{
 		openPorts:     openPorts,
-		sem:           make(chan struct{}, len(ports)),
+		sem:           make(chan struct{}, len(existingPorts)),
 		existingPorts: existingPorts,
 	}
 }
@@ -71,5 +73,17 @@ func (pm *portsPool) Free() int {
 }
 
 func (pm *portsPool) Total() int {
+	pm.Lock()
+
+	defer pm.Unlock()
+
 	return len(pm.existingPorts)
+}
+
+func (pm *portsPool) OpenPorts() []int {
+	pm.Lock()
+
+	defer pm.Unlock()
+
+	return slices.Collect(maps.Keys(pm.openPorts))
 }

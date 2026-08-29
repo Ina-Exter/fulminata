@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -145,7 +145,7 @@ func main() {
 		portsPool:                   pool,
 		rateLimit:                   1,
 		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
-		downloadRequestsChan:        make(chan downloadRequest, 65535),
+		downloadRequestsChan:        make(chan downloadRequestWithID, 65535),
 		downloadQueue:               make(map[string][]downloadRequest, 65535),
 		errChan:                     make(chan error, 10),
 		shutdownChans: map[string]chan struct{}{
@@ -157,12 +157,14 @@ func main() {
 
 	reportingTicker := time.NewTicker(time.Minute)
 
-	ic.connect()
+	ctx := context.Background()
+
+	ic.connect(ctx)
 
 	for {
 		select {
 		case <-reportingTicker.C:
-			fmt.Println("Open ports: ", slices.Collect(maps.Keys(ic.portsPool.openPorts)))
+			fmt.Println("Open ports: ", ic.portsPool.OpenPorts())
 			fmt.Println("Requests by hostname:")
 
 			ic.downloadCountMu.Lock()

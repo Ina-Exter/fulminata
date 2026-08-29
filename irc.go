@@ -5,14 +5,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Protocol string
@@ -25,18 +28,97 @@ const (
 	SXDCC Protocol = "SXDCC"
 )
 
+type downloadRequestWithID struct {
+	downloadRequest
+	uuid.UUID
+}
+
 type downloadRequest struct {
 	Protocol Protocol
 	Nick     string
 	Hostname string
 	Pack     string
-	offset   int64
 }
 
 type downloadProcess struct {
-	downloadRequest
-	cancel func()
-	port   int
+	id uuid.UUID
+	*downloadRequest
+	*downloadTransfer
+}
+
+func newDownloadProcess(req *downloadRequest) downloadProcess {
+	return downloadProcess{
+		id:               uuid.New(),
+		downloadRequest:  req,
+		downloadTransfer: &downloadTransfer{},
+	}
+}
+
+type downloadTransfer struct {
+	contextCancel context.CancelFunc
+	listener      net.Listener
+	conn          net.Conn
+	file          io.ReadCloser
+	port          int
+
+	offsetMu sync.Mutex
+	offset   int64
+
+	cleanupOnce sync.Once
+	cleanupMu   sync.Mutex
+	cleaned     atomic.Bool
+}
+
+func (dt *downloadTransfer) cleanup() {
+	dt.cleanupOnce.Do(
+		func() {
+			dt.cleanupMu.Lock()
+
+			dt.contextCancel()
+
+			for _, o := range []interface {
+				Close() error
+			}{
+				dt.conn,
+				dt.listener,
+				dt.file,
+			} {
+				if o != nil {
+					o.Close()
+				}
+			}
+
+			dt.cleaned.Store(true)
+
+			dt.cleanupMu.Unlock()
+		},
+	)
+}
+
+func (dt *downloadTransfer) registerConn(conn net.Conn) {
+	dt.cleanupMu.Lock()
+
+	dt.conn = conn
+
+	if dt.cleaned.Load() {
+		conn.Close()
+	}
+
+	dt.cleanupMu.Unlock()
+}
+
+func (dt *downloadTransfer) registerOffset(offset int64) {
+	dt.offsetMu.Lock()
+	defer dt.offsetMu.Unlock()
+
+	dt.offset = offset
+}
+
+func (dt *downloadTransfer) getOffset() int64 {
+	dt.offsetMu.Lock()
+	defer dt.offsetMu.Unlock()
+
+	return dt.offset
 }
 
 // one client for one server
@@ -51,7 +133,7 @@ type ircClient struct {
 	listenerBuilderFactory listenerBuilderFactory
 
 	// channel stores requests by clients, they will be processed when a slot is free
-	downloadRequestsChan chan downloadRequest
+	downloadRequestsChan chan downloadRequestWithID
 
 	// store ports in a sequential chan, pick first one
 	portsPool *portsPool
@@ -92,11 +174,12 @@ func (ircw *ircWriter) Notice(to, format string, args ...any) (int, error) {
 	return ircw.Writer.Write(fmt.Appendf([]byte{}, fmt.Sprintf("NOTICE %v :", to)+format, args...))
 }
 
-func (ic *ircClient) connect() error {
+func (ic *ircClient) connect(ctx context.Context) error {
 	fmt.Println("client connecting")
 
 	// 6667 for tcp, 6697 for tls over tcp
-	conn, err := tls.Dial("tcp", "irc.rizon.net:6697", nil)
+	dialer := &tls.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", "irc.rizon.net:6697")
 
 	if err != nil {
 		return err
@@ -107,14 +190,20 @@ func (ic *ircClient) connect() error {
 
 	fmt.Println("start channel goroutine")
 	go func() {
+	outer:
 		for outScan.Scan() {
-			msgData := bytes.Clone(outScan.Bytes())
-			fmt.Println(string(msgData))
-			messageChan <- msgData
-
-			if err := outScan.Err(); err != nil {
-				ic.errChan <- err
+			select {
+			case <-ctx.Done():
+				close(messageChan)
+				break outer
+			default:
+				msgData := bytes.Clone(outScan.Bytes())
+				fmt.Println(string(msgData))
+				messageChan <- msgData
 			}
+		}
+		if err := outScan.Err(); err != nil {
+			ic.errChan <- err
 		}
 	}()
 
@@ -131,6 +220,8 @@ func (ic *ircClient) connect() error {
 				ic.ircMessageHandler(in, message)
 			case <-ic.shutdownChans["irc"]:
 				return
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
@@ -140,10 +231,12 @@ func (ic *ircClient) connect() error {
 			select {
 			case req := <-ic.downloadRequestsChan:
 				if err := ic.processDownloadRequest(in, req); err != nil {
-					ic.dequeue(req.Hostname, req)
+					ic.terminateDownloadProcess(in, req.Hostname, req.UUID)
 					in.Privmsg(req.Nick, "Cannot process your download request: %s", err.Error())
 				}
 			case <-ic.shutdownChans["dcc"]:
+				return
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -239,7 +332,7 @@ func (ic *ircClient) handleDCCMessage(in *ircWriter, msg VerbMsg) {
 	case "LIST":
 		in.Privmsg(msg.Nick, "XDCC LIST Denied: too big for irc. Use /msg %s XDCC SEND list", ic.nickname)
 	case "CANCEL":
-		ic.cancel(msg.Hostname)
+		ic.cancel(in, msg)
 	case "RESUME":
 		ic.resume(in, msg)
 	case "BATCH":
@@ -273,60 +366,19 @@ func (ic *ircClient) send(w *ircWriter, message VerbMsg) error {
 	return nil
 }
 
-func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadRequest) {
-	if len(reqs) == 0 {
-		return
-	}
-
-	nick := reqs[0].Nick
-	hostname := reqs[0].Hostname
-
-	if ic.portsPool.Free() == 0 {
-		w.Privmsg(nick, "Slots are full, please be patient")
-	}
-
-	ic.downloadCountMu.Lock()
-
-	defer ic.downloadCountMu.Unlock()
-
-	processes := ic.downloadProcessesByHostname[hostname]
-	messageSent := false
-
-	for _, req := range reqs {
-		processes = append(
-			processes,
-			downloadProcess{
-				downloadRequest: req,
-			},
-		)
-
-		if len(processes) > ic.rateLimit {
-			if !messageSent {
-				messageSent = true
-				w.Privmsg(nick, "Request queued: you have too many transfer pendings. Please finish or cancel pending transfers.")
-			}
-
-			ic.downloadQueue[hostname] = append(ic.downloadQueue[hostname], req)
-		} else {
-			ic.downloadRequestsChan <- req
-		}
-	}
-
-	ic.downloadProcessesByHostname[hostname] = processes
-}
-
 func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
-	packNumbersPieces := bytes.Split(
-		bytes.ToUpper([]byte(message.Message)), []byte("DCC BATCH "),
+	packNumbersPieces := strings.Fields(
+		strings.ToUpper(message.Message),
 	)
 
-	if len(packNumbersPieces) < 2 {
+	if len(packNumbersPieces) < 3 {
 		w.Privmsg(message.Nick, "Invalid batch cmd.")
 
 		return
 	}
 
-	packNumbers := strings.Split(string(packNumbersPieces[1]), ",")
+	proto := Protocol(packNumbersPieces[0])
+	packNumbers := strings.Split(string(packNumbersPieces[2]), ",")
 
 	reqs := make([]downloadRequest, 0, len(packNumbers))
 
@@ -345,6 +397,7 @@ func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
 		reqs = append(
 			reqs,
 			downloadRequest{
+				Protocol: proto,
 				Nick:     message.Nick,
 				Hostname: message.Hostname,
 				Pack:     packID,
@@ -355,36 +408,22 @@ func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
 	ic.enqueueDownloadRequests(w, reqs)
 }
 
-func (ic *ircClient) cancel(hostname string) {
+func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
 	ic.downloadCountMu.Lock()
 
-	defer ic.downloadCountMu.Unlock()
+	processes := ic.downloadProcessesByHostname[message.Hostname]
 
-	requests := ic.downloadProcessesByHostname[hostname]
-	fmt.Println("cancel first req for hostname ", hostname)
+	ic.downloadCountMu.Unlock()
 
-	if len(requests) > 0 {
-		fmt.Printf("cancel req %v\n", requests[0])
-		if requests[0].cancel != nil {
-			fmt.Println("cancel called")
-			requests[0].cancel()
-		}
-		ic.portsPool.Give(requests[0].port)
-		ic.downloadProcessesByHostname[hostname] = requests[1:]
-	}
+	if len(processes) == 0 {
+		w.Privmsg(message.Nick, "You do not have a transfer running.")
 
-	queue := ic.downloadQueue[hostname]
-
-	if len(queue) == 0 {
 		return
 	}
 
-	nextReq := queue[0]
-	queue = queue[1:]
+	fmt.Println("cancel first running req for hostname ", message.Hostname)
 
-	ic.downloadQueue[hostname] = queue
-
-	ic.downloadRequestsChan <- nextReq
+	ic.terminateDownloadProcess(w, message.Hostname, processes[0].id)
 }
 
 func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
@@ -408,7 +447,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		process := downloadProcess{}
 
 		for i, p := range requests {
-			if p.downloadRequest.Pack == dlr.Pack && p.downloadRequest.Nick == dlr.Nick && !found {
+			if p.downloadRequest.Pack == dlr.Pack && p.downloadRequest.Nick == dlr.Nick && p.port == port && !found {
 				found = true
 
 				index = i
@@ -419,13 +458,13 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		}
 
 		if found {
-			req := process.downloadRequest
-			req.offset = int64(readAt)
-			process.downloadRequest = req
+			process.registerOffset(int64(readAt))
 			requests[index] = process
 			ic.downloadProcessesByHostname[dlr.Hostname] = requests
 		}
 	}
+
+	ic.downloadCountMu.Unlock()
 
 	if !found {
 		w.Privmsg(dlr.Nick, "No request matches RESUME request.")
@@ -433,224 +472,8 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		return
 	}
 
-	ic.downloadCountMu.Unlock()
-
 	// send accept
 	w.Privmsg(dlr.Nick, "\x01DCC ACCEPT \"%v\" %d %d\x01", filename, port, readAt)
-}
-
-func (ic *ircClient) dequeue(hostname string, request downloadRequest) {
-	ic.downloadCountMu.Lock()
-	defer ic.downloadCountMu.Unlock()
-
-	processes := ic.downloadProcessesByHostname[hostname]
-
-	if len(processes) > 0 {
-		once := true
-		newProcesses := make([]downloadProcess, 0, len(processes)-1)
-
-		for _, p := range processes {
-			if p.downloadRequest.Pack == request.Pack && p.downloadRequest.Nick == request.Nick && once {
-				once = false
-				continue
-			}
-
-			newProcesses = append(newProcesses, p)
-		}
-
-		ic.downloadProcessesByHostname[hostname] = newProcesses
-	}
-
-	queue := ic.downloadQueue[hostname]
-
-	if len(queue) == 0 {
-		return
-	}
-
-	nextReq := queue[0]
-	queue = queue[1:]
-
-	ic.downloadQueue[hostname] = queue
-
-	ic.downloadRequestsChan <- nextReq
-}
-
-const defaultTimeout = time.Second * 180
-
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r *contextReader) Read(p []byte) (int, error) {
-	select {
-	case <-r.ctx.Done():
-		return 0, r.ctx.Err()
-	default:
-		return r.r.Read(p)
-	}
-}
-
-func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequest) error {
-	if req.Nick == "" || req.Pack == "" {
-		return errors.New("request is invalid")
-	}
-	fmt.Printf("processing request %v\n", req)
-
-	// open file before conn
-	f, err := ic.fileFetcher.Get(req.Pack)
-
-	if err != nil {
-		return err
-	}
-
-	stats, err := f.Stat()
-
-	if err != nil {
-		f.Close()
-		return err
-	}
-
-	port := ic.portsPool.Take()
-
-	listenerBuilder := ic.listenerBuilderFactory.build(req.Protocol, port)
-
-	ctx, cancelContext := context.WithTimeout(context.Background(), defaultTimeout)
-
-	listener, err := listenerBuilder.listener(ctx)
-
-	if err != nil {
-		cancelContext()
-		f.Close()
-
-		return err
-	}
-
-	ic.alterProcess(
-		req,
-		func(dp *downloadProcess) {
-			if dp == nil {
-				return
-			}
-			dp.cancel = func() {
-				fmt.Printf("cancel called for req %v\n", req)
-				cancelContext()
-				ic.portsPool.Give(port)
-				listener.Close()
-			}
-			dp.port = port
-		},
-	)
-
-	go func(ctx context.Context) {
-		defer func() {
-			if err := recover(); err != nil {
-				fmt.Println("panicked during dcc serve: ", err)
-			}
-		}()
-		defer f.Close()
-		defer ic.portsPool.Give(port)
-		defer cancelContext()
-		defer listener.Close()
-
-		if _, err := listenerBuilder.advertise(w, req.Nick, stats); err != nil {
-			panic(err)
-		}
-
-		conn, err := listener.Accept()
-
-		if err != nil {
-			fmt.Printf("accept fucked up with error %v\n", err.Error())
-
-			return
-		}
-
-		cleanup := func() {
-			ic.portsPool.Give(port)
-			ic.dequeue(req.Hostname, req)
-			cancelContext()
-			conn.Close()
-			listener.Close()
-			f.Close()
-		}
-
-		var offset int64 = 0
-
-		// only used to obtain offset in case of RESUME
-		ic.alterProcess(
-			req,
-			func(dp *downloadProcess) {
-				if dp == nil {
-					return
-				}
-				offset = dp.offset
-			},
-		)
-
-		if offset >= stats.Size() {
-			w.Privmsg(req.Nick, "Invalid offset requested")
-			cleanup()
-
-			return
-		}
-
-		// "reaper"
-		timer := time.AfterFunc(time.Minute*60, cleanup)
-		defer timer.Stop()
-
-		fmt.Println("sending with offset", offset, "and bound", stats.Size()-req.offset)
-
-		fAt, ok := f.(io.ReaderAt)
-
-		if !ok {
-			panic(fmt.Sprintf("file %v does not implement ReaderAt", stats.Name()))
-		}
-
-		transferred, err := io.Copy(
-			conn,
-			&contextReader{
-				ctx: ctx,
-				r:   io.NewSectionReader(fAt, offset, stats.Size()-offset),
-			},
-		)
-
-		fmt.Printf("transferred %d bytes\n", transferred)
-
-		if err != nil {
-			fmt.Printf("copy fucked up with error %v\n", err.Error())
-		}
-
-		time.Sleep(time.Second * 2)
-		cleanup()
-
-		w.Privmsg(req.Nick, "This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.")
-	}(ctx)
-
-	return nil
-}
-
-func (ic *ircClient) alterProcess(req downloadRequest, callback func(*downloadProcess)) {
-	ic.downloadCountMu.Lock()
-	defer ic.downloadCountMu.Unlock()
-
-	var process *downloadProcess
-
-	processes := ic.downloadProcessesByHostname[req.Hostname]
-	index := 0
-
-	for i, p := range processes {
-		if p.downloadRequest.Hostname == req.Hostname && p.downloadRequest.Nick == req.Nick && p.downloadRequest.Pack == req.Pack {
-			index = i
-			process = &p
-		}
-	}
-
-	callback(process)
-
-	if process != nil {
-		processes[index] = *process
-		ic.downloadProcessesByHostname[req.Hostname] = processes
-	}
 }
 
 func decodeSend(message VerbMsg) downloadRequest {

@@ -62,14 +62,11 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 	persistanceTicker := time.NewTicker(4 * time.Minute)
 
 	go func() {
-		for {
-			select {
-			case <-persistanceTicker.C:
-				if err := fh.persistCounts(); err != nil {
-					fmt.Println(err)
-				} else {
-					fmt.Println("persisted counts")
-				}
+		for range persistanceTicker.C {
+			if err := fh.persistCounts(); err != nil {
+				fmt.Println(err)
+			} else {
+				fmt.Println("persisted counts")
 			}
 		}
 	}()
@@ -273,15 +270,19 @@ func (fh *fsHandler) persistCounts() error {
 	snapshot := maps.Clone(fh.countBuffer)
 	fh.countBufferMu.Unlock()
 
-	countFile, err := os.OpenFile(fh.downloadsCountBackingFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-
-	defer countFile.Close()
+	countFile, err := os.OpenFile(fh.downloadsCountBackingFile+".new", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 
 	if err != nil {
 		return err
 	}
 
-	return json.NewEncoder(countFile).Encode(snapshot)
+	defer countFile.Close()
+
+	if err := json.NewEncoder(countFile).Encode(snapshot); err != nil {
+		return err
+	}
+
+	return os.Rename(fh.downloadsCountBackingFile+".new", fh.downloadsCountBackingFile)
 }
 
 func format(s int64) string {

@@ -1,8 +1,9 @@
 module github.com/ina-exter/fulminata
 
-go 1.25.8
+go 1.27.0
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260113154411-7d0074ccc6f1
 )

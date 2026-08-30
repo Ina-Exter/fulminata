@@ -30,6 +30,12 @@ type PackInfo struct {
 	Size   int64
 }
 
+type FileHandler interface {
+	Exists(string) bool
+	Get(string) (fs.File, error)
+	Lookup(string) (string, error)
+}
+
 type fsHandler struct {
 	fsAccess   fs.FS
 	pool       *portsPool

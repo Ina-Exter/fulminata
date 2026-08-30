@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 )
 
 type Protocol string
@@ -123,7 +124,7 @@ func (dt *downloadTransfer) getOffset() int64 {
 
 // one client for one server
 type ircClient struct {
-	fileFetcher *fsHandler
+	fileFetcher FileHandler
 
 	nickname                  string
 	registrationPassword      string
@@ -346,24 +347,51 @@ func trimPackName(r rune) bool {
 	return r == '\x01' || r == '#' || r == ' '
 }
 
-func (ic *ircClient) send(w *ircWriter, message VerbMsg) error {
-	req := decodeSend(message)
+func (ic *ircClient) send(w *ircWriter, message VerbMsg) {
+	req, err := ic.decodeSend(message)
 
-	if req.Nick == "" || req.Pack == "" {
-		return nil
+	if err != nil {
+		w.Privmsg(req.Nick, "DCC SEND request is invalid: %s", err.Error())
+
+		return
 	}
 
-	if !ic.fileFetcher.Exists(req.Pack) {
-		w.Privmsg(req.Nick, "Pack not found")
-
-		return nil
-	}
-
-	// slot check for extra message
-	// remove?
 	ic.enqueueDownloadRequests(w, []downloadRequest{req})
+}
 
-	return nil
+func (ic *ircClient) decodeSend(message VerbMsg) (downloadRequest, error) {
+	// :Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND #5
+	packNumberPieces := strings.Fields(
+		strings.ToUpper(
+			strings.Trim(message.Message, "\x01"),
+		),
+	)
+
+	if len(packNumberPieces) < 3 {
+		return downloadRequest{}, errors.New("invalid request structure")
+	}
+
+	proto := Protocol(packNumberPieces[0])
+
+	if strings.ToUpper(packNumberPieces[1]) == "SSEND" {
+		proto = SDCC
+	}
+
+	pack := strings.TrimFunc(
+		string(packNumberPieces[2]),
+		trimPackName,
+	)
+
+	if !ic.fileFetcher.Exists(pack) {
+		return downloadRequest{}, errors.New("pack not found")
+	}
+
+	return downloadRequest{
+		Protocol: proto,
+		Nick:     message.Nick,
+		Hostname: message.Hostname,
+		Pack:     pack,
+	}, nil
 }
 
 func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
@@ -426,19 +454,27 @@ func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
 	ic.terminateDownloadProcess(w, message.Hostname, processes[0].id)
 }
 
+type resumeRequest struct {
+	downloadRequest
+	filename string
+	port     int
+	readAt   int
+}
+
 func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 	w.Privmsg(message.Nick, "DCC RESUME is experimental, be warned.")
-	dlr, filename, port, readAt := ic.decodeResume(message)
-	fmt.Println("obtained resume request: ", dlr, filename, port, readAt)
+	rreq, err := ic.decodeResume(message)
+	fmt.Println("obtained resume request: ", rreq.downloadRequest, rreq.filename, rreq.port, rreq.readAt)
 
-	if dlr.Pack == "" || dlr.Nick == "" || filename == "" || readAt <= 0 {
-		w.Privmsg(message.Nick, "DCC RESUME request is invalid or was improperly passed, please XDCC CANCEL and try again.")
+	if err != nil {
+		w.Privmsg(message.Nick, "DCC RESUME request is invalid or was improperly passed, please XDCC CANCEL and try again: %s", err.Error())
+
 		return
 	}
 
 	ic.downloadCountMu.Lock()
 
-	requests := ic.downloadProcessesByHostname[dlr.Hostname]
+	requests := ic.downloadProcessesByHostname[rreq.Hostname]
 
 	found := false
 
@@ -447,7 +483,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		process := downloadProcess{}
 
 		for i, p := range requests {
-			if p.downloadRequest.Pack == dlr.Pack && p.downloadRequest.Nick == dlr.Nick && p.port == port && !found {
+			if p.downloadRequest.Pack == rreq.Pack && p.downloadRequest.Nick == rreq.Nick && p.port == rreq.port && !found {
 				found = true
 
 				index = i
@@ -458,67 +494,35 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		}
 
 		if found {
-			process.registerOffset(int64(readAt))
+			process.registerOffset(int64(rreq.readAt))
 			requests[index] = process
-			ic.downloadProcessesByHostname[dlr.Hostname] = requests
+			ic.downloadProcessesByHostname[rreq.Hostname] = requests
 		}
 	}
 
 	ic.downloadCountMu.Unlock()
 
 	if !found {
-		w.Privmsg(dlr.Nick, "No request matches RESUME request.")
+		w.Privmsg(rreq.Nick, "No request matches RESUME request. Either repeat request or download from start.")
 
 		return
 	}
 
 	// send accept
-	w.Privmsg(dlr.Nick, "\x01DCC ACCEPT \"%v\" %d %d\x01", filename, port, readAt)
+	w.Privmsg(rreq.Nick, "\x01DCC ACCEPT \"%v\" %d %d\x01", rreq.filename, rreq.port, rreq.readAt)
 }
 
-func decodeSend(message VerbMsg) downloadRequest {
-	// :Exterminata!~Extermina@AFC539C.716A7309.A137196A.IP PRIVMSG Fulminata|Experiment :XDCC SEND #5
-	packNumberPieces := strings.Fields(
-		strings.ToUpper(
-			strings.Trim(message.Message, "\x01"),
-		),
-	)
-
-	if len(packNumberPieces) < 3 {
-		return downloadRequest{}
-	}
-
-	proto := Protocol(packNumberPieces[0])
-
-	if strings.ToUpper(packNumberPieces[1]) == "SSEND" {
-		proto = SDCC
-	}
-
-	return downloadRequest{
-		Protocol: proto,
-		Nick:     message.Nick,
-		Hostname: message.Hostname,
-		Pack: strings.TrimFunc(
-			string(packNumberPieces[2]),
-			trimPackName,
-		),
-	}
-}
-
-func (ic *ircClient) decodeResume(message VerbMsg) (downloadRequest, string, int, int) {
+func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 	resumeDataPieces := bytes.Split([]byte(message.Message), []byte("DCC RESUME "))
 
 	if len(resumeDataPieces) <= 1 {
-		return downloadRequest{}, "", 0, 0
+		return resumeRequest{}, errors.New("missing request element")
 	}
 
-	resumeData := bytes.Split(
-		bytes.TrimSuffix(resumeDataPieces[1], []byte("\x01")),
-		[]byte(" "),
-	)
+	resumeData := bytes.Fields(bytes.TrimSuffix(resumeDataPieces[1], []byte("\x01")))
 
 	if len(resumeData) < 3 {
-		return downloadRequest{}, "", 0, 0
+		return resumeRequest{}, errors.New("missing request element")
 	}
 
 	filename := strings.Trim(string(bytes.Join(resumeData[0:len(resumeData)-2], []byte(" "))), "\"")
@@ -527,25 +531,46 @@ func (ic *ircClient) decodeResume(message VerbMsg) (downloadRequest, string, int
 	port, err := strconv.Atoi(portStr)
 
 	if err != nil {
-		return downloadRequest{}, "", 0, 0
+		return resumeRequest{}, errors.Wrap(err, "port is not a valid int")
 	}
 
 	readAtStr := string(resumeData[len(resumeData)-1])
 	readAt, err := strconv.Atoi(readAtStr)
 
 	if err != nil {
-		return downloadRequest{}, "", 0, 0
+		return resumeRequest{}, errors.Wrap(err, "offset is not a valid int")
 	}
 
 	packID, err := ic.fileFetcher.Lookup(filename)
 
 	if err != nil {
-		return downloadRequest{}, "", 0, 0
+		return resumeRequest{}, errors.Wrap(err, "cannot lookup pack")
 	}
 
-	return downloadRequest{
+	pack, err := ic.fileFetcher.Get(packID)
+
+	if err != nil {
+		return resumeRequest{}, errors.Wrap(err, "cannot get pack")
+	}
+
+	defer pack.Close()
+
+	stats, err := pack.Stat()
+
+	if err != nil {
+		return resumeRequest{}, errors.Wrap(err, "cannot get pack stats")
+	}
+
+	if readAt < 0 || readAt > int(stats.Size()) {
+		return resumeRequest{}, errors.New("requested offset is out of bounds")
+	}
+
+	return resumeRequest{
 		Nick:     message.Nick,
 		Hostname: message.Hostname,
 		Pack:     packID,
-	}, filename, port, readAt
+		filename: filename,
+		port:     port,
+		readAt:   readAt,
+	}, nil
 }

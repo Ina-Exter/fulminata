@@ -137,7 +137,7 @@ func main() {
 		nickname:             nick,
 		registrationPassword: registrationPassword,
 		channel:              joinChan,
-		listenerBuilderFactory: listenerBuilderFactory{
+		listenerBuilderFactory: &defaultListenerBuilderFactory{
 			localIP:      localIP,
 			externalIP:   mustExtractIP(),
 			certificates: certs,
@@ -159,7 +159,9 @@ func main() {
 
 	ctx := context.Background()
 
-	ic.connect(ctx)
+	if err := ic.connect(ctx, "irc.rizon.net:6697"); err != nil {
+		panic("could not connect to IRC server: " + err.Error())
+	}
 
 	for {
 		select {

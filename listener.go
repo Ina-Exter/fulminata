@@ -12,26 +12,30 @@ import (
 	"time"
 )
 
-type listenerBuilderFactory struct {
+type listenerBuilderFactory interface {
+	build(prot Protocol, port int) listenerBuilder
+}
+
+type defaultListenerBuilderFactory struct {
 	externalIP   uint32
 	localIP      string
 	certificates []tls.Certificate
 }
 
-func (lbf listenerBuilderFactory) build(prot Protocol, port int) listenerBuilder {
+func (dlbf defaultListenerBuilderFactory) build(prot Protocol, port int) listenerBuilder {
 	switch prot {
 	case DCC, XDCC:
 		return tcpListenerBuilder{
-			externalIP: lbf.externalIP,
-			localIP:    lbf.localIP,
+			externalIP: dlbf.externalIP,
+			localIP:    dlbf.localIP,
 			port:       port,
 		}
 	case SDCC:
 		return tcpOverTLSListenerBuilder{
-			externalIP: lbf.externalIP,
-			localIP:    lbf.localIP,
+			externalIP: dlbf.externalIP,
+			localIP:    dlbf.localIP,
 			port:       port,
-			certs:      lbf.certificates,
+			certs:      dlbf.certificates,
 		}
 	}
 

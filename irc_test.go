@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDecodeSend(t *testing.T) {
@@ -90,10 +91,20 @@ func TestDecodeSend(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			ic := &ircClient{
+				fileFetcher: &fakeFileHandler{
+					filesByPackID: map[string]*fakeFile{
+						"1":  {},
+						"10": {},
+					},
+				},
+			}
+
 			msg := Parse(tt.haveMsg)
 
-			req := decodeSend(msg.(VerbMsg))
+			req, err := ic.decodeSend(msg.(VerbMsg))
 
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantNick, req.Nick)
 			assert.Equal(t, tt.wantHost, req.Hostname)
 			assert.Equal(t, tt.wantPack, req.Pack)
@@ -115,13 +126,13 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 	}{
 		{
 			name:         "quoted",
-			haveMsg:      []byte(":Exterminata!~Extermina@Rizon-96DE5C73.rev.sfr.net PRIVMSG Fulminata|Experiment :\x01DCC RESUME \"[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv\" 38545 524844064\x01"),
+			haveMsg:      []byte(":Exterminata!~Extermina@Rizon-96DE5C73.rev.sfr.net PRIVMSG Fulminata|Experiment :\x01DCC RESUME \"[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv\" 38545 5248\x01"),
 			wantNick:     "Exterminata",
 			wantHost:     "Rizon-96DE5C73.rev.sfr.net",
 			wantPack:     "1",
 			wantFilename: "[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv",
 			wantPort:     38545,
-			wantReadAt:   524844064,
+			wantReadAt:   5248,
 		},
 		{
 			name:         "unquoted",
@@ -136,23 +147,35 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ic := &ircClient{
-				fileFetcher: &fsHandler{
-					lookupID: map[string]PackInfo{
-						"1": {Name: "[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv"},
+				fileFetcher: &fakeFileHandler{
+					filesByPackID: map[string]*fakeFile{
+						"list": {
+							info: &fakeInfo{
+								name: "fulminata.txt",
+								size: 777777,
+							},
+						},
+						"1": {
+							info: &fakeInfo{
+								name: "[SubsPlease] 16bit Sensation - Another Layer - 01 (1080p) [C13E9494].mkv",
+								size: 777777,
+							},
+						},
 					},
 				},
 			}
 
 			msg := Parse(tt.haveMsg)
 
-			req, filename, port, readAt := ic.decodeResume(msg.(VerbMsg))
+			req, err := ic.decodeResume(msg.(VerbMsg))
 
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantNick, req.Nick)
 			assert.Equal(t, tt.wantHost, req.Hostname)
 			assert.Equal(t, tt.wantPack, req.Pack)
-			assert.Equal(t, tt.wantFilename, filename)
-			assert.Equal(t, tt.wantPort, port)
-			assert.Equal(t, tt.wantReadAt, readAt)
+			assert.Equal(t, tt.wantFilename, req.filename)
+			assert.Equal(t, tt.wantPort, req.port)
+			assert.Equal(t, tt.wantReadAt, req.readAt)
 		})
 	}
 }

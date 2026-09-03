@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -27,7 +28,11 @@ const (
 	XDCC  Protocol = "XDCC"
 	SDCC  Protocol = "SDCC"
 	SXDCC Protocol = "SXDCC"
+
+	maxIRCLineBytes = 510
 )
+
+var errIRCLineTooLong = errors.New("irc line exceeds size limit")
 
 type downloadRequestWithID struct {
 	downloadRequest
@@ -75,7 +80,9 @@ func (dt *downloadTransfer) cleanup() {
 		func() {
 			dt.cleanupMu.Lock()
 
-			dt.contextCancel()
+			if dt.contextCancel != nil {
+				dt.contextCancel()
+			}
 
 			for _, o := range []interface {
 				Close() error
@@ -146,86 +153,105 @@ type ircClient struct {
 	// stores requests by clients, they will be processed when a slot is free, key is hostname
 	downloadQueue map[string][]downloadRequest
 
-	shutdownChans map[string]chan struct{}
-	errChan       chan error
+	ircErrChan chan error
 }
 
-type writeFlusher struct {
+type formatterWriter struct {
 	w io.Writer
 }
 
-func (wf *writeFlusher) Write(p []byte) (int, error) {
+func (fw *formatterWriter) Write(p []byte) (int, error) {
 	fmt.Println(string(p))
-	if !bytes.HasSuffix(p, []byte("\n")) {
-		return wf.w.Write(append(p, byte('\n')))
+
+	cleaned := cleanIRCMessage(p)
+
+	if len(cleaned) > maxIRCLineBytes {
+		return 0, errIRCLineTooLong
 	}
 
-	return wf.w.Write(p)
+	return fw.w.Write(append(cleaned, []byte("\r\n")...))
 }
 
 type ircWriter struct {
 	io.Writer
 }
 
+func cleanIRCMessage(in []byte) []byte {
+	out := in
+
+	for _, b := range [][]byte{{'\r'}, {'\n'}} {
+		out = bytes.ReplaceAll(out, b, []byte{})
+	}
+
+	return out
+}
+
 func (ircw *ircWriter) Privmsg(to, format string, args ...any) (int, error) {
-	return ircw.Writer.Write(fmt.Appendf([]byte{}, fmt.Sprintf("PRIVMSG %v :", to)+format, args...))
+	return ircw.Writer.Write(
+		fmt.Appendf(
+			[]byte{},
+			fmt.Sprintf("PRIVMSG %v :", to)+format,
+			args...,
+		),
+	)
 }
 
 func (ircw *ircWriter) Notice(to, format string, args ...any) (int, error) {
-	return ircw.Writer.Write(fmt.Appendf([]byte{}, fmt.Sprintf("NOTICE %v :", to)+format, args...))
+	return ircw.Writer.Write(
+		fmt.Appendf(
+			[]byte{},
+			fmt.Sprintf("NOTICE %v :", to)+format,
+			args...,
+		),
+	)
 }
 
-func (ic *ircClient) connect(ctx context.Context) error {
+func (ic *ircClient) connect(ctx context.Context, address string) (func() error, error) {
 	fmt.Println("client connecting")
 
 	// 6667 for tcp, 6697 for tls over tcp
 	dialer := &tls.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", "irc.rizon.net:6697")
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	outScan := bufio.NewScanner(conn)
-	messageChan := make(chan []byte)
+	in := &ircWriter{&formatterWriter{w: conn}}
 
-	fmt.Println("start channel goroutine")
+	fmt.Println("start irc goroutine")
+	// irc side background handler loop
 	go func() {
 	outer:
 		for outScan.Scan() {
 			select {
 			case <-ctx.Done():
-				close(messageChan)
+				conn.Close()
+
 				break outer
 			default:
-				msgData := bytes.Clone(outScan.Bytes())
-				fmt.Println(string(msgData))
-				messageChan <- msgData
+				message := bytes.Clone(outScan.Bytes())
+				fmt.Println(string(message))
+				ic.ircMessageHandler(in, message)
 			}
 		}
-		if err := outScan.Err(); err != nil {
-			ic.errChan <- err
-		}
+		ic.ircErrChan <- cmp.Or(outScan.Err(), errors.New("call context cancelled or irc EOF"))
 	}()
 
 	fmt.Println("send handshake")
-	in := &ircWriter{&writeFlusher{w: conn}}
-	in.Write(fmt.Appendf([]byte{}, "USER fulminata * 0 :%s\n", ic.nickname))
-	in.Write(fmt.Appendf([]byte{}, "NICK %s\n", ic.nickname))
 
-	// irc side background handler loop
-	go func() {
-		for {
-			select {
-			case message := <-messageChan: // message received on serv, process accordingly
-				ic.ircMessageHandler(in, message)
-			case <-ic.shutdownChans["irc"]:
-				return
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	if _, err := in.Write(fmt.Appendf([]byte{}, "USER fulminata * 0 :%s\n", ic.nickname)); err != nil {
+		conn.Close()
+
+		return nil, err
+	}
+	if _, err := in.Write(fmt.Appendf([]byte{}, "NICK %s\n", ic.nickname)); err != nil {
+		conn.Close()
+
+		return nil, err
+	}
+
 	// dcc side background handler loop
 	go func() {
 		for {
@@ -235,15 +261,26 @@ func (ic *ircClient) connect(ctx context.Context) error {
 					ic.terminateDownloadProcess(in, req.Hostname, req.UUID)
 					in.Privmsg(req.Nick, "Cannot process your download request: %s", err.Error())
 				}
-			case <-ic.shutdownChans["dcc"]:
-				return
 			case <-ctx.Done():
+				ic.downloadCountMu.Lock()
+
+				// flush all processes upon ctx done
+				for hostname, process := range ic.downloadProcessesByHostname {
+					for _, p := range process {
+						trans := ic.extractProcess(hostname, p.id)
+						trans.cleanup()
+						ic.portsPool.Give(trans.port)
+					}
+				}
+
+				ic.downloadCountMu.Unlock()
+
 				return
 			}
 		}
 	}()
 
-	return nil
+	return conn.Close, nil
 }
 
 func (ic *ircClient) ircMessageHandler(in *ircWriter, message []byte) {
@@ -338,6 +375,8 @@ func (ic *ircClient) handleDCCMessage(in *ircWriter, msg VerbMsg) {
 		ic.resume(in, msg)
 	case "BATCH":
 		ic.batch(in, msg)
+	case "REMOVE":
+		ic.remove(in, msg)
 	default:
 		in.Privmsg(msg.Nick, "Unimplemented DCC action.")
 	}
@@ -351,7 +390,7 @@ func (ic *ircClient) send(w *ircWriter, message VerbMsg) {
 	req, err := ic.decodeSend(message)
 
 	if err != nil {
-		w.Privmsg(req.Nick, "DCC SEND request is invalid: %s", err.Error())
+		w.Privmsg(message.Nick, "DCC SEND request is invalid: %s", err.Error())
 
 		return
 	}
@@ -441,24 +480,41 @@ func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
 
 	processes := ic.downloadProcessesByHostname[message.Hostname]
 
+	if len(processes) == 0 {
+		w.Privmsg(message.Nick, "You do not have a transfer running.")
+		ic.downloadCountMu.Unlock()
+
+		return
+	}
+
+	var targetProcessID, zero uuid.UUID
+
+	for _, p := range processes {
+		if p.Nick == message.Nick {
+			targetProcessID = p.id
+
+			break
+		}
+	}
+
 	ic.downloadCountMu.Unlock()
 
-	if len(processes) == 0 {
+	if targetProcessID == zero {
 		w.Privmsg(message.Nick, "You do not have a transfer running.")
 
 		return
 	}
 
-	fmt.Println("cancel first running req for hostname ", message.Hostname)
+	fmt.Println("cancel first running req for hostname ", message.Hostname, "and nick", message.Nick)
 
-	ic.terminateDownloadProcess(w, message.Hostname, processes[0].id)
+	ic.terminateDownloadProcess(w, message.Hostname, targetProcessID)
 }
 
 type resumeRequest struct {
 	downloadRequest
 	filename string
 	port     int
-	readAt   int
+	readAt   int64
 }
 
 func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
@@ -494,7 +550,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		}
 
 		if found {
-			process.registerOffset(int64(rreq.readAt))
+			process.registerOffset(rreq.readAt)
 			requests[index] = process
 			ic.downloadProcessesByHostname[rreq.Hostname] = requests
 		}
@@ -513,29 +569,33 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 }
 
 func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
-	resumeDataPieces := bytes.Split([]byte(message.Message), []byte("DCC RESUME "))
+	resumeData := strings.Fields(
+		strings.Trim(message.Message, "\x01"),
+	)
 
-	if len(resumeDataPieces) <= 1 {
+	if len(resumeData) <= 4 {
 		return resumeRequest{}, errors.New("missing request element")
 	}
 
-	resumeData := bytes.Fields(bytes.TrimSuffix(resumeDataPieces[1], []byte("\x01")))
-
-	if len(resumeData) < 3 {
-		return resumeRequest{}, errors.New("missing request element")
+	if !strings.EqualFold(resumeData[1], "resume") {
+		return resumeRequest{}, errors.New("invalid verb")
 	}
 
-	filename := strings.Trim(string(bytes.Join(resumeData[0:len(resumeData)-2], []byte(" "))), "\"")
+	filename := strings.Trim(strings.Join(resumeData[2:len(resumeData)-2], " "), "\"")
 
-	portStr := string(resumeData[len(resumeData)-2])
+	portStr := resumeData[len(resumeData)-2]
 	port, err := strconv.Atoi(portStr)
 
 	if err != nil {
 		return resumeRequest{}, errors.Wrap(err, "port is not a valid int")
 	}
 
-	readAtStr := string(resumeData[len(resumeData)-1])
-	readAt, err := strconv.Atoi(readAtStr)
+	if port <= 0 {
+		return resumeRequest{}, errors.New("invalid port")
+	}
+
+	readAtStr := resumeData[len(resumeData)-1]
+	readAt, err := strconv.ParseInt(readAtStr, 10, 64)
 
 	if err != nil {
 		return resumeRequest{}, errors.Wrap(err, "offset is not a valid int")
@@ -547,7 +607,7 @@ func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 		return resumeRequest{}, errors.Wrap(err, "cannot lookup pack")
 	}
 
-	pack, err := ic.fileFetcher.Get(packID)
+	pack, err := ic.fileFetcher.Get(packID, false)
 
 	if err != nil {
 		return resumeRequest{}, errors.Wrap(err, "cannot get pack")
@@ -561,7 +621,7 @@ func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 		return resumeRequest{}, errors.Wrap(err, "cannot get pack stats")
 	}
 
-	if readAt < 0 || readAt > int(stats.Size()) {
+	if readAt < 0 || readAt >= stats.Size() {
 		return resumeRequest{}, errors.New("requested offset is out of bounds")
 	}
 
@@ -573,4 +633,8 @@ func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 		port:     port,
 		readAt:   readAt,
 	}, nil
+}
+
+func (ic *ircClient) remove(w *ircWriter, message VerbMsg) {
+	w.Privmsg(message.Nick, "Unimplemented yet!")
 }

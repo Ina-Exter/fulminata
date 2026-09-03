@@ -1,4 +1,7 @@
 data/*
 mount/*
+secrets/*
+registration.json
 list.txt
 fulminata.tar
+fulminata

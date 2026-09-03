@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 /*
@@ -63,7 +64,7 @@ func (vm VerbMsg) Raw() []byte {
 }
 
 func (vm VerbMsg) IsPrivmsgToMe(me string) bool {
-	return vm.Verb == "PRIVMSG" && vm.To == me
+	return strings.EqualFold(vm.Verb, "PRIVMSG") && strings.EqualFold(vm.To, me)
 }
 
 func (vm VerbMsg) SystemMessage() bool {

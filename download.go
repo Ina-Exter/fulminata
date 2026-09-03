@@ -40,6 +40,15 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 
 	ic.downloadCountMu.Lock()
 
+	totalOccupied := len(ic.downloadProcessesByHostname[hostname]) + len(ic.downloadQueue[hostname])
+	allowed := max(0, 100-totalOccupied)
+
+	if allowed < len(reqs) {
+		w.Privmsg(nick, "You may only have up to 100 transfers running and queued at a time. Packs above this limit will be ignored")
+
+		reqs = reqs[:allowed]
+	}
+
 	free := ic.rateLimit - len(ic.downloadProcessesByHostname[hostname])
 
 	toSend := reqs[:min(free, len(reqs))]
@@ -71,6 +80,26 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 func (ic *ircClient) terminateDownloadProcess(w *ircWriter, hostname string, id uuid.UUID) {
 	ic.downloadCountMu.Lock()
 
+	targetTransfer := ic.extractProcess(hostname, id)
+
+	queue := ic.downloadQueue[hostname]
+
+	if targetTransfer == nil || targetTransfer.cleaned.Load() {
+		ic.downloadCountMu.Unlock()
+
+		return
+	}
+
+	delete(ic.downloadQueue, hostname)
+	ic.downloadCountMu.Unlock()
+
+	// avoid cleaning up under lock
+	targetTransfer.cleanup()
+	ic.portsPool.Give(targetTransfer.port)
+	ic.enqueueDownloadRequests(w, queue)
+}
+
+func (ic *ircClient) extractProcess(hostname string, id uuid.UUID) *downloadTransfer {
 	var targetTransfer *downloadTransfer
 
 	processes := ic.downloadProcessesByHostname[hostname]
@@ -80,9 +109,7 @@ func (ic *ircClient) terminateDownloadProcess(w *ircWriter, hostname string, id 
 		for _, p := range processes {
 			if p.id == id {
 				if p.downloadTransfer != nil {
-					if !p.cleaned.Load() {
-						targetTransfer = p.downloadTransfer
-					}
+					targetTransfer = p.downloadTransfer
 				}
 
 				continue
@@ -94,20 +121,7 @@ func (ic *ircClient) terminateDownloadProcess(w *ircWriter, hostname string, id 
 		ic.downloadProcessesByHostname[hostname] = newProcesses
 	}
 
-	queue := ic.downloadQueue[hostname]
-
-	if targetTransfer == nil || len(queue) == 0 {
-		targetTransfer.cleanup()
-		ic.downloadCountMu.Unlock()
-
-		return
-	}
-
-	delete(ic.downloadQueue, hostname)
-	ic.downloadCountMu.Unlock()
-
-	targetTransfer.cleanup()
-	ic.enqueueDownloadRequests(w, queue)
+	return targetTransfer
 }
 
 func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWithID) error {
@@ -119,7 +133,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 	fmt.Printf("processing request %v\n", req)
 
 	// open file before conn
-	f, err := ic.fileFetcher.Get(req.Pack)
+	f, err := ic.fileFetcher.Get(req.Pack, true)
 
 	if err != nil {
 		return err
@@ -173,6 +187,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 		cancelAcceptCtx()
 		f.Close()
 		ic.portsPool.Give(port)
+		listener.Close()
 
 		return errors.New("process not registered")
 	}

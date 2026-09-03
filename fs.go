@@ -10,6 +10,7 @@ import (
 	"maps"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,7 +33,7 @@ type PackInfo struct {
 
 type FileHandler interface {
 	Exists(string) bool
-	Get(string) (fs.File, error)
+	Get(string, bool) (fs.File, error)
 	Lookup(string) (string, error)
 }
 
@@ -42,7 +43,7 @@ type fsHandler struct {
 	lookupID   map[string]PackInfo
 	lookupPack map[PackInfo]string
 
-	// count
+	// downloads count and file sync
 	countBufferMu             sync.Mutex
 	countBuffer               map[string]int
 	downloadsCountBackingFile string
@@ -167,7 +168,7 @@ func trimPackID(id string) string {
 	)
 }
 
-func (fh *fsHandler) Get(packID string) (fs.File, error) {
+func (fh *fsHandler) Get(packID string, increment bool) (fs.File, error) {
 	packID = trimPackID(packID)
 
 	if strings.ToLower(packID) == listPack {
@@ -186,9 +187,11 @@ func (fh *fsHandler) Get(packID string) (fs.File, error) {
 		return nil, ErrNotFound
 	}
 
-	fh.countBufferMu.Lock()
-	fh.countBuffer[packPath]++
-	fh.countBufferMu.Unlock()
+	if increment {
+		fh.countBufferMu.Lock()
+		fh.countBuffer[packPath]++
+		fh.countBufferMu.Unlock()
+	}
 
 	return fh.fsAccess.Open(packPath)
 }
@@ -276,23 +279,43 @@ func (fh *fsHandler) persistCounts() error {
 	snapshot := maps.Clone(fh.countBuffer)
 	fh.countBufferMu.Unlock()
 
-	countFile, err := os.OpenFile(fh.downloadsCountBackingFile+".new", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	countFile, err := os.CreateTemp(filepath.Dir(fh.downloadsCountBackingFile), "counts-file-temp")
 
 	if err != nil {
 		return err
 	}
 
-	defer countFile.Close()
-
 	if err := json.NewEncoder(countFile).Encode(snapshot); err != nil {
+		countFile.Close()
+		os.Remove(countFile.Name())
+
 		return err
 	}
 
-	return os.Rename(fh.downloadsCountBackingFile+".new", fh.downloadsCountBackingFile)
+	if err := countFile.Sync(); err != nil {
+		countFile.Close()
+		os.Remove(countFile.Name())
+
+		return err
+	}
+
+	if err := countFile.Close(); err != nil {
+		os.Remove(countFile.Name())
+
+		return err
+	}
+
+	if err := os.Rename(countFile.Name(), fh.downloadsCountBackingFile); err != nil {
+		os.Remove(countFile.Name())
+
+		return err
+	}
+
+	return nil
 }
 
 func format(s int64) string {
-	sizes := []string{"B", "K", "M", "G"}
+	sizes := []string{"B", "K", "M", "G", "T"}
 	return humanateBytes(s, 1000, sizes)
 }
 
@@ -305,6 +328,11 @@ func humanateBytes(s int64, base float64, sizes []string) string {
 		return fmt.Sprintf("%dB", s)
 	}
 	e := math.Floor(logn(float64(s), base))
+
+	if e > 4 {
+		return ">999TB"
+	}
+
 	suffix := sizes[int(e)]
 	val := math.Floor(float64(s)/math.Pow(base, e)*10+0.5) / 10
 	f := "%.0f%s"

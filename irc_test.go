@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDecodeSend(t *testing.T) {
+func TestIRCClient_DecodeSend(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
 		haveMsg      []byte
@@ -122,7 +122,7 @@ func TestIRCClient_DecodeResume(t *testing.T) {
 		wantPack     string
 		wantFilename string
 		wantPort     int
-		wantReadAt   int
+		wantReadAt   int64
 	}{
 		{
 			name:         "quoted",

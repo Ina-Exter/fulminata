@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path"
 	"strconv"
@@ -19,63 +19,64 @@ import (
 	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
-func ip2int(ip net.IP) uint32 {
-	if len(ip) == 16 {
-		return binary.BigEndian.Uint32(ip[12:16])
-	}
-
-	return binary.BigEndian.Uint32(ip)
-}
-
-func getEnvFallback(key, def string) string {
+func getEnvFallback[T any](key string, def T, mapper func(string) T) T {
 	val, ok := os.LookupEnv(key)
 
-	if ok {
-		return val
+	if !ok {
+		return def
 	}
 
-	return def
+	return mapper(val)
 }
 
-func mustExtractIP() uint32 {
-	req, err := http.NewRequest(http.MethodGet, "https://ifconfig.me", http.NoBody)
+func extractIPv4() (uint32, error) {
+	// should always return ipv4
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", http.NoBody)
 
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
-
-	req.Header.Add("User-Agent", "curl")
 
 	resp, err := http.DefaultClient.Do(req)
 
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		panic(fmt.Sprintf("invalid status code for ip discovery: %d", resp.StatusCode))
+		return 0, fmt.Errorf("invalid status code for ip discovery: %d", resp.StatusCode)
 	}
 
 	strIP, err := io.ReadAll(resp.Body)
 
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
 
-	ip := net.ParseIP(string(strIP))
+	ip, err := netip.ParseAddr(string(strIP))
 
-	if ip == nil {
-		panic("invalid self ip")
+	if err != nil {
+		return 0, err
 	}
 
-	return ip2int(ip)
+	if !ip.Is4() {
+		return 0, errors.New("ip is not v4")
+	}
+
+	ipBytes := ip.As4()
+
+	return binary.BigEndian.Uint32(ipBytes[:]), nil
 }
 
 func spinTLSConfig() ([]tls.Certificate, error) {
-	tlsCertPath := getEnvFallback("TLS_CERT_PATH", "")
-	tlsKeyPath := getEnvFallback("TLS_KEY_PATH", "")
+	tlsCertPath := getEnvFallback("TLS_CERT_PATH", "", func(s string) string { return s })
+	tlsKeyPath := getEnvFallback("TLS_KEY_PATH", "", func(s string) string { return s })
 
 	if tlsCertPath == "" || tlsKeyPath == "" {
 		return nil, errors.New("no certificate paths provided")
@@ -103,30 +104,51 @@ func spinTLSConfig() ([]tls.Certificate, error) {
 }
 
 func main() {
-	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "")
-	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime")
-	joinChan := getEnvFallback("CHANNEL", "#exter-periment")
-	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68")
-	portsStr := strings.Split(getEnvFallback("PORTS", "38542,38543"), ",")
-	nick := getEnvFallback("NICK", "Fulminata|Experiment")
-	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"))
+	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "", func(s string) string { return s })
+	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime", func(s string) string { return s })
+	joinChan := getEnvFallback("CHANNEL", "#exter-periment", func(s string) string { return s })
+	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68", func(s string) string { return s })
+	ports := getEnvFallback("PORTS", []int{38542, 38543}, func(s string) []int {
+		portsStr := strings.Split(s, ",")
+		ports := make([]int, 0, len(portsStr))
+
+		for _, ps := range portsStr {
+			pint, err := strconv.Atoi(ps)
+
+			if err != nil {
+				panic("invalid port" + ps + ":" + err.Error())
+			}
+
+			if pint <= 0 || pint > 65535 {
+				panic("invalid port" + strconv.Itoa(pint))
+			}
+
+			ports = append(ports, pint)
+		}
+
+		return ports
+	})
+	nick := getEnvFallback("NICK", "Fulminata|Experiment", func(s string) string { return s })
+	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"), func(s string) string { return s })
+	rateLimit := getEnvFallback("RATE_LIMIT", 1, func(val string) int {
+		ival, err := strconv.Atoi(val)
+
+		if err != nil || ival <= 0 {
+			panic(fmt.Sprintf("Invalid value %s given to key RATE_LIMIT, expected int", val))
+		}
+
+		return ival
+	})
+	remoteIP, err := extractIPv4()
+
+	if err != nil {
+		panic("could not extract remote IP:" + err.Error())
+	}
 
 	certs, err := spinTLSConfig()
 
 	if err != nil {
 		fmt.Println("cannot get tls certificate:", err, ", bot starting without SDCC capabilities")
-	}
-
-	ports := make([]int, 0, len(portsStr))
-
-	for _, ps := range portsStr {
-		pint, err := strconv.Atoi(ps)
-
-		if err != nil || pint == 0 {
-			panic("invalid port" + ps + ":" + err.Error())
-		}
-
-		ports = append(ports, pint)
 	}
 
 	pool := newPortsPool(ports)
@@ -139,27 +161,26 @@ func main() {
 		channel:              joinChan,
 		listenerBuilderFactory: &defaultListenerBuilderFactory{
 			localIP:      localIP,
-			externalIP:   mustExtractIP(),
+			externalIP:   remoteIP,
 			certificates: certs,
 		},
 		portsPool:                   pool,
-		rateLimit:                   1,
+		rateLimit:                   rateLimit,
 		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
 		downloadRequestsChan:        make(chan downloadRequestWithID, 65535),
 		downloadQueue:               make(map[string][]downloadRequest, 65535),
-		errChan:                     make(chan error, 10),
-		shutdownChans: map[string]chan struct{}{
-			"dcc": make(chan struct{}),
-			"irc": make(chan struct{}),
-		},
-		fileFetcher: fsHandler,
+		ircErrChan:                  make(chan error, 10),
+		fileFetcher:                 fsHandler,
 	}
 
 	reportingTicker := time.NewTicker(time.Minute)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 
-	if err := ic.connect(ctx, "irc.rizon.net:6697"); err != nil {
+	disconnect, err := ic.connect(ctx, "irc.rizon.net:6697")
+
+	if err != nil {
+		cancel()
 		panic("could not connect to IRC server: " + err.Error())
 	}
 
@@ -176,12 +197,18 @@ func main() {
 			for hn, reqs := range snapshot {
 				fmt.Println(hn, reqs)
 			}
-		case err := <-ic.errChan:
+		case err := <-ic.ircErrChan:
 			fmt.Println("fatal error received:", err)
 
-			for _, c := range ic.shutdownChans {
-				c <- struct{}{}
-			}
+			disconnect()
+			cancel()
+
+			return
+		case <-ctx.Done():
+			fmt.Println("context done received")
+
+			disconnect()
+			cancel()
 
 			return
 		}

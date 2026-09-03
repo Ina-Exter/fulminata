@@ -46,7 +46,7 @@ func (ffh *fakeFileHandler) Exists(packID string) bool {
 	return ok
 }
 
-func (ffh *fakeFileHandler) Get(packID string) (fs.File, error) {
+func (ffh *fakeFileHandler) Get(packID string, _ bool) (fs.File, error) {
 	f, ok := ffh.filesByPackID[packID]
 
 	if !ok {

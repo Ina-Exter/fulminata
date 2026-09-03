@@ -518,7 +518,6 @@ type resumeRequest struct {
 }
 
 func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
-	w.Privmsg(message.Nick, "DCC RESUME is experimental, be warned.")
 	rreq, err := ic.decodeResume(message)
 	fmt.Println("obtained resume request: ", rreq.downloadRequest, rreq.filename, rreq.port, rreq.readAt)
 

@@ -8,7 +8,7 @@ import (
 )
 
 /*
-	This follows the pattern of:
+This follows the pattern of:
 
 - optional @ (tags) and tags
 - :

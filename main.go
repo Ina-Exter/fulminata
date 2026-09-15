@@ -29,6 +29,16 @@ func getEnvFallback[T any](key string, def T, mapper func(string) T) T {
 	return mapper(val)
 }
 
+func stringNotEmpty(name string) func(string) string {
+	return func(s string) string {
+		if s == "" {
+			panic(name + "cannot be empty")
+		}
+
+		return s
+	}
+}
+
 func extractIPv4() (uint32, error) {
 	// should always return ipv4
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
@@ -104,10 +114,31 @@ func spinTLSConfig() ([]tls.Certificate, error) {
 }
 
 func main() {
+	nick := getEnvFallback("NICK", "Fulminata|Experiment", stringNotEmpty("NICK"))
 	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "", func(s string) string { return s })
-	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime", func(s string) string { return s })
-	joinChan := getEnvFallback("CHANNEL", "#exter-periment", func(s string) string { return s })
-	localIP := getEnvFallback("LOCAL_IP", "192.168.1.68", func(s string) string { return s })
+	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime", stringNotEmpty("ROOT_FOLDER"))
+	joinChan := getEnvFallback("CHANNEL", "#exter-periment", stringNotEmpty("CHANNEL"))
+	localIP := getEnvFallback(
+		"LOCAL_IP",
+		"192.168.1.68",
+		func(s string) string {
+			if s == "" {
+				panic("LOCAL_IP cannot be empty")
+			}
+
+			parsedIP, err := netip.ParseAddr(s)
+
+			if err != nil {
+				panic("cannot parse ip" + err.Error())
+			}
+
+			if !parsedIP.Is4() {
+				panic("IP is not a v4 ip")
+			}
+
+			return s
+		},
+	)
 	ports := getEnvFallback("PORTS", []int{38542, 38543}, func(s string) []int {
 		portsStr := strings.Split(s, ",")
 		ports := make([]int, 0, len(portsStr))
@@ -128,8 +159,7 @@ func main() {
 
 		return ports
 	})
-	nick := getEnvFallback("NICK", "Fulminata|Experiment", func(s string) string { return s })
-	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"), func(s string) string { return s })
+	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"), stringNotEmpty("DOWNLOADS_COUNTER_FILE_PATH"))
 	rateLimit := getEnvFallback("RATE_LIMIT", 1, func(val string) int {
 		ival, err := strconv.Atoi(val)
 
@@ -190,9 +220,9 @@ func main() {
 			fmt.Println("Open ports: ", ic.portsPool.OpenPorts())
 			fmt.Println("Requests by hostname:")
 
-			ic.downloadCountMu.Lock()
+			ic.downloadProcessesMu.Lock()
 			snapshot := maps.Clone(ic.downloadProcessesByHostname)
-			ic.downloadCountMu.Unlock()
+			ic.downloadProcessesMu.Unlock()
 
 			for hn, reqs := range snapshot {
 				fmt.Println(hn, reqs)

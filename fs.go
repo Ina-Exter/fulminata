@@ -171,7 +171,7 @@ func trimPackID(id string) string {
 func (fh *fsHandler) Get(packID string, increment bool) (fs.File, error) {
 	packID = trimPackID(packID)
 
-	if strings.ToLower(packID) == listPack {
+	if strings.ToLower(packID) == listPack || packID == "-1" {
 		return fh.list()
 	}
 

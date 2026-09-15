@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,7 +130,6 @@ func (dt *downloadTransfer) getOffset() int64 {
 	return dt.offset
 }
 
-// one client for one server
 type ircClient struct {
 	fileFetcher FileHandler
 
@@ -148,7 +148,7 @@ type ircClient struct {
 
 	// ratelimit mechanism
 	rateLimit                   int
-	downloadCountMu             sync.Mutex
+	downloadProcessesMu         sync.Mutex
 	downloadProcessesByHostname map[string][]downloadProcess
 	// stores requests by clients, they will be processed when a slot is free, key is hostname
 	downloadQueue map[string][]downloadRequest
@@ -262,7 +262,7 @@ func (ic *ircClient) connect(ctx context.Context, address string) (func() error,
 					in.Privmsg(req.Nick, "Cannot process your download request: %s", err.Error())
 				}
 			case <-ctx.Done():
-				ic.downloadCountMu.Lock()
+				ic.downloadProcessesMu.Lock()
 
 				// flush all processes upon ctx done
 				for hostname, process := range ic.downloadProcessesByHostname {
@@ -273,7 +273,7 @@ func (ic *ircClient) connect(ctx context.Context, address string) (func() error,
 					}
 				}
 
-				ic.downloadCountMu.Unlock()
+				ic.downloadProcessesMu.Unlock()
 
 				return
 			}
@@ -434,18 +434,26 @@ func (ic *ircClient) decodeSend(message VerbMsg) (downloadRequest, error) {
 }
 
 func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
+	reqs, err := ic.decodeBatch(message)
+
+	if err != nil {
+		w.Privmsg(message.Nick, "Cannot process your batch request: %s", err.Error())
+	}
+
+	ic.enqueueDownloadRequests(w, reqs)
+}
+
+func (ic *ircClient) decodeBatch(message VerbMsg) ([]downloadRequest, error) {
 	packNumbersPieces := strings.Fields(
 		strings.ToUpper(message.Message),
 	)
 
 	if len(packNumbersPieces) < 3 {
-		w.Privmsg(message.Nick, "Invalid batch cmd.")
-
-		return
+		return nil, errors.New("invalid batch cmd structure")
 	}
 
 	proto := Protocol(packNumbersPieces[0])
-	packNumbers := strings.Split(string(packNumbersPieces[2]), ",")
+	packNumbers := strings.Split(strings.Join(packNumbersPieces[2:], " "), ",")
 
 	reqs := make([]downloadRequest, 0, len(packNumbers))
 
@@ -456,9 +464,7 @@ func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
 		)
 
 		if !ic.fileFetcher.Exists(packID) {
-			w.Privmsg(message.Nick, "Pack not found")
-
-			return
+			return nil, fmt.Errorf("pack not found: %s", packID)
 		}
 
 		reqs = append(
@@ -472,17 +478,17 @@ func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
 		)
 	}
 
-	ic.enqueueDownloadRequests(w, reqs)
+	return reqs, nil
 }
 
 func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
-	ic.downloadCountMu.Lock()
+	ic.downloadProcessesMu.Lock()
 
 	processes := ic.downloadProcessesByHostname[message.Hostname]
 
 	if len(processes) == 0 {
 		w.Privmsg(message.Nick, "You do not have a transfer running.")
-		ic.downloadCountMu.Unlock()
+		ic.downloadProcessesMu.Unlock()
 
 		return
 	}
@@ -497,7 +503,7 @@ func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
 		}
 	}
 
-	ic.downloadCountMu.Unlock()
+	ic.downloadProcessesMu.Unlock()
 
 	if targetProcessID == zero {
 		w.Privmsg(message.Nick, "You do not have a transfer running.")
@@ -527,7 +533,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		return
 	}
 
-	ic.downloadCountMu.Lock()
+	ic.downloadProcessesMu.Lock()
 
 	requests := ic.downloadProcessesByHostname[rreq.Hostname]
 
@@ -555,7 +561,7 @@ func (ic *ircClient) resume(w *ircWriter, message VerbMsg) {
 		}
 	}
 
-	ic.downloadCountMu.Unlock()
+	ic.downloadProcessesMu.Unlock()
 
 	if !found {
 		w.Privmsg(rreq.Nick, "No request matches RESUME request. Either repeat request or download from start.")
@@ -635,5 +641,80 @@ func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 }
 
 func (ic *ircClient) remove(w *ircWriter, message VerbMsg) {
-	w.Privmsg(message.Nick, "Unimplemented yet!")
+	sel, err := ic.decodeRemove(message)
+
+	if err != nil {
+		w.Privmsg(message.Nick, "Cannot decode remove request: %s", err.Error())
+
+		return
+	}
+
+	switch {
+	case sel.all:
+		ic.downloadProcessesMu.Lock()
+
+		delete(ic.downloadQueue, message.Hostname)
+
+		ic.downloadProcessesMu.Unlock()
+
+		w.Privmsg(message.Nick, "Download queue cleared")
+	case len(sel.packs) > 0:
+		ic.downloadProcessesMu.Lock()
+
+		currentQueue := ic.downloadQueue[message.Hostname]
+		newQueue := make([]downloadRequest, 0, len(currentQueue))
+
+		for _, req := range currentQueue {
+			if slices.Contains(sel.packs, req.Pack) {
+				continue
+			}
+
+			newQueue = append(newQueue, req)
+		}
+
+		ic.downloadQueue[message.Hostname] = newQueue
+
+		ic.downloadProcessesMu.Unlock()
+
+		w.Privmsg(message.Nick, "Unqueued selected packs")
+	default:
+		w.Privmsg(message.Nick, "Pack selection is invalid, please try again")
+
+		return
+	}
+}
+
+type removeSelector struct {
+	all   bool
+	packs []string
+}
+
+func (ic *ircClient) decodeRemove(msg VerbMsg) (*removeSelector, error) {
+	removeData := strings.Fields(
+		strings.Trim(msg.Message, "\x01"),
+	)
+
+	if !(strings.HasSuffix(strings.ToUpper(removeData[0]), "DCC") && strings.EqualFold(removeData[1], "remove")) {
+		return nil, errors.New("invalid remove request")
+	}
+
+	switch {
+	case len(removeData) == 2:
+		return &removeSelector{all: true}, nil
+	case len(removeData) > 2:
+		packs := strings.Split(strings.Join(removeData[2:], " "), ",")
+		trimmedPacks := make([]string, 0, len(packs))
+
+		for _, p := range packs {
+			trimmedPacks = append(
+				trimmedPacks,
+				strings.TrimFunc(p, trimPackName),
+			)
+		}
+
+		return &removeSelector{packs: trimmedPacks}, nil
+	default:
+	}
+
+	return nil, errors.New("invalid pack selector")
 }

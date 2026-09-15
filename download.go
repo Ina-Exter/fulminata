@@ -26,21 +26,34 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	}
 }
 
-func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadRequest) {
-	if len(reqs) == 0 {
+func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, inputReqs []downloadRequest) {
+	if len(inputReqs) == 0 {
 		return
 	}
 
-	nick := reqs[0].Nick
-	hostname := reqs[0].Hostname
+	nick := inputReqs[0].Nick
+	hostname := inputReqs[0].Hostname
 
-	if ic.portsPool.Free() == 0 {
-		w.Privmsg(nick, "Slots are full, please be patient")
+	ic.downloadProcessesMu.Lock()
+
+	processes := ic.downloadProcessesByHostname[hostname]
+	queue := ic.downloadQueue[hostname]
+
+	reqs := filterRequests(processes, queue, inputReqs)
+
+	if len(reqs) == 0 {
+		ic.downloadProcessesMu.Unlock()
+
+		if len(inputReqs) == 1 {
+			w.Privmsg(nick, "Pack already requested.")
+		} else {
+			w.Privmsg(nick, "Packs already requested.")
+		}
+
+		return
 	}
 
-	ic.downloadCountMu.Lock()
-
-	totalOccupied := len(ic.downloadProcessesByHostname[hostname]) + len(ic.downloadQueue[hostname])
+	totalOccupied := len(processes) + len(queue)
 	allowed := max(0, 100-totalOccupied)
 
 	if allowed < len(reqs) {
@@ -56,7 +69,6 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 
 	ic.downloadQueue[hostname] = append(ic.downloadQueue[hostname], toQueue...)
 	toShip := make([]downloadRequestWithID, 0, len(toSend))
-	processes := ic.downloadProcessesByHostname[hostname]
 
 	for _, req := range toSend {
 		p := newDownloadProcess(&req)
@@ -66,7 +78,11 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 
 	ic.downloadProcessesByHostname[hostname] = processes
 
-	ic.downloadCountMu.Unlock()
+	ic.downloadProcessesMu.Unlock()
+
+	if ic.portsPool.Free() == 0 {
+		w.Privmsg(nick, "Slots are full, please be patient")
+	}
 
 	if len(toQueue) > 0 {
 		w.Privmsg(nick, "Request queued: you have too many transfer pendings. Please finish or cancel pending transfers.")
@@ -77,21 +93,49 @@ func (ic *ircClient) enqueueDownloadRequests(w *ircWriter, reqs []downloadReques
 	}
 }
 
+func filterRequests(processes []downloadProcess, queue []downloadRequest, reqs []downloadRequest) []downloadRequest {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	currentPacks := make(map[string]struct{}, len(processes)+len(queue))
+
+	for _, p := range processes {
+		currentPacks[p.Pack] = struct{}{}
+	}
+
+	for _, r := range queue {
+		currentPacks[r.Pack] = struct{}{}
+	}
+
+	newReqs := make([]downloadRequest, 0, len(reqs))
+
+	for _, r := range reqs {
+		if _, ok := currentPacks[r.Pack]; ok {
+			continue
+		}
+
+		newReqs = append(newReqs, r)
+	}
+
+	return newReqs
+}
+
 func (ic *ircClient) terminateDownloadProcess(w *ircWriter, hostname string, id uuid.UUID) {
-	ic.downloadCountMu.Lock()
+	ic.downloadProcessesMu.Lock()
 
 	targetTransfer := ic.extractProcess(hostname, id)
 
 	queue := ic.downloadQueue[hostname]
 
 	if targetTransfer == nil || targetTransfer.cleaned.Load() {
-		ic.downloadCountMu.Unlock()
+		ic.downloadProcessesMu.Unlock()
 
 		return
 	}
 
 	delete(ic.downloadQueue, hostname)
-	ic.downloadCountMu.Unlock()
+	ic.downloadProcessesMu.Unlock()
 
 	// avoid cleaning up under lock
 	targetTransfer.cleanup()
@@ -164,7 +208,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 		return err
 	}
 
-	ic.downloadCountMu.Lock()
+	ic.downloadProcessesMu.Lock()
 
 	var (
 		index   int
@@ -183,7 +227,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 	}
 
 	if !found {
-		ic.downloadCountMu.Unlock()
+		ic.downloadProcessesMu.Unlock()
 		cancelAcceptCtx()
 		f.Close()
 		ic.portsPool.Give(port)
@@ -206,7 +250,7 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 
 	ic.downloadProcessesByHostname[req.Hostname] = processes
 
-	ic.downloadCountMu.Unlock()
+	ic.downloadProcessesMu.Unlock()
 
 	go func(ctx context.Context) {
 		// "reaper"

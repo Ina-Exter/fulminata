@@ -138,9 +138,14 @@ type ircClient struct {
 	channel                   string
 	handshakeAndJoinCompleted bool
 
+	// blacklist is fairly aggressive but that is fine
+	// if you warrant getting put on there you likely deserved it
+	blacklistedHostnames []string
+	blacklistedNicks     []string
+
 	listenerBuilderFactory listenerBuilderFactory
 
-	// channel stores requests by clients, they will be processed when a slot is free
+	// channel stores requests by clients, they will be processed when a port is free
 	downloadRequestsChan chan downloadRequestWithID
 
 	// store ports in a sequential chan, pick first one
@@ -150,7 +155,7 @@ type ircClient struct {
 	rateLimit                   int
 	downloadProcessesMu         sync.Mutex
 	downloadProcessesByHostname map[string][]downloadProcess
-	// stores requests by clients, they will be processed when a slot is free, key is hostname
+	// stores requests by clients, they will be processed when they have fewer than ratelimit requests in process, key is hostname
 	downloadQueue map[string][]downloadRequest
 
 	ircErrChan chan error
@@ -296,6 +301,10 @@ func (ic *ircClient) ircMessageHandler(in *ircWriter, message []byte) {
 			return
 		}
 
+		if !ic.allowedSender(msg) {
+			return
+		}
+
 		if !msg.IsPrivmsgToMe(ic.nickname) {
 			// only direct privmsg supported yet
 			return
@@ -303,6 +312,10 @@ func (ic *ircClient) ircMessageHandler(in *ircWriter, message []byte) {
 
 		ic.handlePrivMsg(in, msg)
 	}
+}
+
+func (ic *ircClient) allowedSender(msg VerbMsg) bool {
+	return !slices.Contains(ic.blacklistedHostnames, msg.Hostname) && !slices.Contains(ic.blacklistedNicks, msg.Nick)
 }
 
 func (ic *ircClient) handleSystemMessage(in *ircWriter, msg VerbMsg) {
@@ -612,7 +625,7 @@ func (ic *ircClient) decodeResume(message VerbMsg) (resumeRequest, error) {
 		return resumeRequest{}, errors.Wrap(err, "cannot lookup pack")
 	}
 
-	pack, err := ic.fileFetcher.Get(packID, false)
+	pack, err := ic.fileFetcher.Get(packID)
 
 	if err != nil {
 		return resumeRequest{}, errors.Wrap(err, "cannot get pack")

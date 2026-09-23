@@ -169,6 +169,8 @@ func main() {
 
 		return ival
 	})
+	blacklistedNicks := getEnvFallback("BLACKLISTED_NICKS", nil, func(val string) []string { return strings.Split(val, ",") })
+	blacklistedHostnames := getEnvFallback("BLACKLISTED_HOSTNAMES", nil, func(val string) []string { return strings.Split(val, ",") })
 	remoteIP, err := extractIPv4()
 
 	if err != nil {
@@ -189,6 +191,8 @@ func main() {
 		nickname:             nick,
 		registrationPassword: registrationPassword,
 		channel:              joinChan,
+		blacklistedHostnames: blacklistedHostnames,
+		blacklistedNicks:     blacklistedNicks,
 		listenerBuilderFactory: &defaultListenerBuilderFactory{
 			localIP:      localIP,
 			externalIP:   remoteIP,

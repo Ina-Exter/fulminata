@@ -177,11 +177,13 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 	fmt.Printf("processing request %v\n", req)
 
 	// open file before conn
-	f, err := ic.fileFetcher.Get(req.Pack, true)
+	f, err := ic.fileFetcher.Get(req.Pack)
 
 	if err != nil {
 		return err
 	}
+
+	ic.fileFetcher.Count(Started, req.Pack, req.Hostname, req.Nick)
 
 	stats, err := f.Stat()
 
@@ -323,9 +325,10 @@ func (ic *ircClient) processDownloadRequest(w *ircWriter, req downloadRequestWit
 			return
 		}
 
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second)
 
 		w.Privmsg(req.Nick, "This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.")
+		ic.fileFetcher.Count(Finished, req.Pack, req.Hostname, req.Nick)
 	}(downloadCtx)
 
 	return nil

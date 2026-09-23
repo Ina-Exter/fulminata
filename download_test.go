@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"maps"
+	"net"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -404,6 +407,126 @@ func TestIRCClient_EnqueueDownloadRequest(t *testing.T) {
 
 			for _, s := range tt.wantWritten {
 				assert.Contains(t, writeBuff.String(), s)
+			}
+		})
+	}
+}
+
+func TestIRCClient_ProcessDownloadRequest(t *testing.T) {
+	testUUID1 := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+	for _, tt := range []struct {
+		name string
+
+		req       downloadRequestWithID
+		processes map[string][]downloadProcess
+
+		wantWritten        []string
+		wantDownloadedFile []byte
+	}{
+		{
+			name: "success",
+
+			req: downloadRequestWithID{
+				UUID:     testUUID1,
+				Protocol: XDCC,
+				Nick:     "Phoenix",
+				Hostname: "krampus.judge",
+				Pack:     "1",
+			},
+			processes: map[string][]downloadProcess{
+				"krampus.judge": {
+					{
+						id: testUUID1,
+						downloadRequest: &downloadRequest{
+							Protocol: XDCC,
+							Nick:     "Phoenix",
+							Hostname: "krampus.judge",
+							Pack:     "1",
+						},
+						downloadTransfer: &downloadTransfer{},
+					},
+				},
+			},
+
+			wantWritten: []string{
+				"PRIVMSG Phoenix :\x01DCC SEND \"fake_file.mkv\" 2130706433 50001 12\x01",
+				"PRIVMSG Phoenix :This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.",
+			},
+			wantDownloadedFile: []byte("this is file"),
+		},
+		{
+			name: "offset",
+
+			req: downloadRequestWithID{
+				UUID:     testUUID1,
+				Protocol: XDCC,
+				Nick:     "Phoenix",
+				Hostname: "krampus.judge",
+				Pack:     "1",
+			},
+			processes: map[string][]downloadProcess{
+				"krampus.judge": {
+					{
+						id: testUUID1,
+						downloadRequest: &downloadRequest{
+							Protocol: XDCC,
+							Nick:     "Phoenix",
+							Hostname: "krampus.judge",
+							Pack:     "1",
+						},
+						downloadTransfer: &downloadTransfer{
+							offset: 6,
+						},
+					},
+				},
+			},
+
+			wantWritten: []string{
+				"PRIVMSG Phoenix :\x01DCC SEND \"fake_file.mkv\" 2130706433 50001 12\x01",
+				"PRIVMSG Phoenix :This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.",
+			},
+			wantDownloadedFile: []byte("s file"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ic := &ircClient{
+				portsPool: newPortsPool([]int{50001}),
+				listenerBuilderFactory: &defaultListenerBuilderFactory{
+					externalIP: 2130706433, // 127.0.0.1
+					localIP:    "127.0.0.1",
+				},
+				fileFetcher: &fakeFileHandler{
+					filesByPackID: map[string]*fakeFile{
+						"1": {
+							info: &fakeInfo{
+								name: "fake_file.mkv",
+								size: 12,
+							},
+							file: bytes.NewReader([]byte("this is file")),
+						},
+					},
+				},
+				downloadProcessesByHostname: tt.processes,
+			}
+			w := bytes.Buffer{}
+
+			err := ic.processDownloadRequest(&ircWriter{Writer: &w}, tt.req)
+
+			require.NoError(t, err)
+
+			conn, err := net.Dial("tcp", "127.0.0.1:50001")
+
+			require.NoError(t, err)
+
+			fileBuff, err := io.ReadAll(conn)
+
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantDownloadedFile, fileBuff)
+
+			for _, s := range tt.wantWritten {
+				assert.Contains(t, w.String(), s)
 			}
 		})
 	}

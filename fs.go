@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"math"
@@ -25,16 +26,36 @@ const (
 
 var ErrNotFound = errors.New("pack not found")
 
+type Operation string
+
+var (
+	Started  Operation = "started"
+	Finished Operation = "Finished"
+)
+
 type PackInfo struct {
 	PackID string
 	Name   string
 	Size   int64
 }
 
+type countsStruct struct {
+	DownloadCounts map[string]count `json:"downloads"`
+	// hostname => nick => count
+	UserCounts map[string]map[string]count `json:"users"`
+}
+
+type count struct {
+	Started  int `json:"started"`
+	Finished int `json:"finished"`
+}
+
 type FileHandler interface {
 	Exists(string) bool
-	Get(string, bool) (fs.File, error)
+	Get(string) (fs.File, error)
 	Lookup(string) (string, error)
+	// pack, user, nick
+	Count(Operation, string, string, string)
 }
 
 type fsHandler struct {
@@ -45,7 +66,7 @@ type fsHandler struct {
 
 	// downloads count and file sync
 	countBufferMu             sync.Mutex
-	countBuffer               map[string]int
+	countBuffer               countsStruct
 	downloadsCountBackingFile string
 }
 
@@ -54,11 +75,14 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 	lookupID, lookupPack := mustBuildLookups(fsAccess)
 
 	fh := &fsHandler{
-		fsAccess:                  fsAccess,
-		pool:                      pool,
-		lookupID:                  lookupID,
-		lookupPack:                lookupPack,
-		countBuffer:               make(map[string]int),
+		fsAccess:   fsAccess,
+		pool:       pool,
+		lookupID:   lookupID,
+		lookupPack: lookupPack,
+		countBuffer: countsStruct{
+			DownloadCounts: make(map[string]count),
+			UserCounts:     make(map[string]map[string]count),
+		},
 		downloadsCountBackingFile: counterFile,
 	}
 
@@ -66,7 +90,7 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 		panic(err)
 	}
 
-	persistanceTicker := time.NewTicker(4 * time.Minute)
+	persistanceTicker := time.NewTicker(4 * time.Second)
 
 	go func() {
 		for range persistanceTicker.C {
@@ -168,7 +192,7 @@ func trimPackID(id string) string {
 	)
 }
 
-func (fh *fsHandler) Get(packID string, increment bool) (fs.File, error) {
+func (fh *fsHandler) Get(packID string) (fs.File, error) {
 	packID = trimPackID(packID)
 
 	if strings.ToLower(packID) == listPack || packID == "-1" {
@@ -185,12 +209,6 @@ func (fh *fsHandler) Get(packID string, increment bool) (fs.File, error) {
 
 	if !ok {
 		return nil, ErrNotFound
-	}
-
-	if increment {
-		fh.countBufferMu.Lock()
-		fh.countBuffer[packPath]++
-		fh.countBufferMu.Unlock()
 	}
 
 	return fh.fsAccess.Open(packPath)
@@ -210,6 +228,46 @@ func (fh *fsHandler) Lookup(filename string) (string, error) {
 	return "", ErrNotFound
 }
 
+func (fh *fsHandler) Count(op Operation, pack, hostname, nick string) {
+	fh.countBufferMu.Lock()
+
+	defer fh.countBufferMu.Unlock()
+
+	packInfo, ok := fh.lookupID[pack]
+
+	if !ok {
+		return
+	}
+
+	path := fh.lookupPack[packInfo]
+
+	if !ok {
+		return
+	}
+
+	dc := fh.countBuffer.DownloadCounts[path]
+	uc := fh.countBuffer.UserCounts[hostname]
+
+	if uc == nil {
+		uc = make(map[string]count)
+	}
+
+	ucc := uc[nick]
+
+	switch op {
+	case Started:
+		dc.Started++
+		ucc.Started++
+	case Finished:
+		dc.Finished++
+		ucc.Finished++
+	}
+
+	uc[nick] = ucc
+	fh.countBuffer.DownloadCounts[path] = dc
+	fh.countBuffer.UserCounts[hostname] = uc
+}
+
 func (fh *fsHandler) list() (fs.File, error) {
 	infos := slices.Collect(maps.Values(fh.lookupID))
 
@@ -226,13 +284,14 @@ func (fh *fsHandler) list() (fs.File, error) {
 	b.Write(fmt.Appendf([]byte{}, "** %d packs, %d of %d slots open **\n", len(infos), fh.pool.Free(), fh.pool.Total()))
 
 	fh.countBufferMu.Lock()
-	defer fh.countBufferMu.Unlock()
+	snapshot := maps.Clone(fh.countBuffer.DownloadCounts)
+	fh.countBufferMu.Unlock()
 
 	for _, pack := range infos {
 		path := fh.lookupPack[pack]
-		count := fh.countBuffer[path]
+		count := snapshot[path]
 
-		b.Write(fmt.Appendf([]byte{}, "#%s %dx [%s] %s\n", pack.PackID, count, format(pack.Size), pack.Name))
+		b.Write(fmt.Appendf([]byte{}, "#%s %dx [%s] %s\n", pack.PackID, count.Finished, format(pack.Size), pack.Name))
 	}
 
 	reader := bytes.NewReader(b.Bytes())
@@ -252,7 +311,10 @@ func (fh *fsHandler) loadCounts() error {
 	switch {
 	case err == nil:
 	case os.IsNotExist(err):
-		fh.countBuffer = make(map[string]int)
+		fh.countBuffer = countsStruct{
+			DownloadCounts: make(map[string]count),
+			UserCounts:     make(map[string]map[string]count),
+		}
 
 		return nil
 	default:
@@ -261,13 +323,42 @@ func (fh *fsHandler) loadCounts() error {
 
 	defer countFile.Close()
 
-	var counts map[string]int
+	var (
+		counts       countsStruct
+		legacyCounts map[string]int
+	)
 
-	if err := json.NewDecoder(countFile).Decode(&counts); err != nil {
+	buff, err := io.ReadAll(countFile)
+
+	if err != nil {
 		return err
 	}
 
+	if err := json.NewDecoder(bytes.NewReader(buff)).Decode(&counts); err != nil {
+		return err
+	}
+
+	if err := json.NewDecoder(bytes.NewReader(buff)).Decode(&legacyCounts); err != nil {
+		fmt.Printf("cannot get legacy counts: %s\n", err.Error())
+		legacyCounts = make(map[string]int)
+	}
+
 	fh.countBufferMu.Lock()
+
+	if counts.DownloadCounts == nil {
+		counts.DownloadCounts = make(map[string]count)
+	}
+
+	if counts.UserCounts == nil {
+		counts.UserCounts = make(map[string]map[string]count)
+	}
+
+	for p, c := range legacyCounts {
+		dc := counts.DownloadCounts[p]
+		dc.Finished += c
+		counts.DownloadCounts[p] = dc
+	}
+
 	fh.countBuffer = counts
 	fh.countBufferMu.Unlock()
 
@@ -276,7 +367,10 @@ func (fh *fsHandler) loadCounts() error {
 
 func (fh *fsHandler) persistCounts() error {
 	fh.countBufferMu.Lock()
-	snapshot := maps.Clone(fh.countBuffer)
+	snapshot := countsStruct{
+		DownloadCounts: maps.Clone(fh.countBuffer.DownloadCounts),
+		UserCounts:     maps.Clone(fh.countBuffer.UserCounts),
+	}
 	fh.countBufferMu.Unlock()
 
 	countFile, err := os.CreateTemp(filepath.Dir(fh.downloadsCountBackingFile), "counts-file-temp")

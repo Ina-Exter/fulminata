@@ -263,7 +263,7 @@ func (ic *ircClient) connect(ctx context.Context, address string) (func() error,
 			select {
 			case req := <-ic.downloadRequestsChan:
 				if err := ic.processDownloadRequest(in, req); err != nil {
-					ic.terminateDownloadProcess(in, req.Hostname, req.UUID)
+					ic.terminateDownloadProcess(in, req.Nick, req.Hostname, req.UUID)
 					in.Privmsg(req.Nick, "Cannot process your download request: %s", err.Error())
 				}
 			case <-ctx.Done():
@@ -408,7 +408,7 @@ func (ic *ircClient) send(w *ircWriter, message VerbMsg) {
 		return
 	}
 
-	ic.enqueueDownloadRequests(w, []downloadRequest{req})
+	ic.enqueueDownloadRequests(w, message.Nick, message.Hostname, []downloadRequest{req})
 }
 
 func (ic *ircClient) decodeSend(message VerbMsg) (downloadRequest, error) {
@@ -453,7 +453,11 @@ func (ic *ircClient) batch(w *ircWriter, message VerbMsg) {
 		w.Privmsg(message.Nick, "Cannot process your batch request: %s", err.Error())
 	}
 
-	ic.enqueueDownloadRequests(w, reqs)
+	if len(reqs) == 0 {
+		return
+	}
+
+	ic.enqueueDownloadRequests(w, message.Nick, message.Hostname, reqs)
 }
 
 func (ic *ircClient) decodeBatch(message VerbMsg) ([]downloadRequest, error) {
@@ -526,7 +530,7 @@ func (ic *ircClient) cancel(w *ircWriter, message VerbMsg) {
 
 	fmt.Println("cancel first running req for hostname ", message.Hostname, "and nick", message.Nick)
 
-	ic.terminateDownloadProcess(w, message.Hostname, targetProcessID)
+	ic.terminateDownloadProcess(w, message.Nick, message.Hostname, targetProcessID)
 }
 
 type resumeRequest struct {

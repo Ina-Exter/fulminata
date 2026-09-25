@@ -2,15 +2,40 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"maps"
 	"net"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
 
 func makeRequest(nick, host, pack string) downloadRequest {
 	return downloadRequest{
@@ -39,9 +64,12 @@ func TestIRCClient_EnqueueDownloadRequest(t *testing.T) {
 		wantWritten     []string
 	}{
 		{
-			name:            "empty queue, no reqs",
-			wantInChan:      []downloadRequest{},
-			assertProcesses: func(*testing.T, map[string][]downloadProcess) {},
+			name:                 "empty queue, no reqs",
+			haveExistingQueue:    map[string][]downloadRequest{},
+			haveExistingRequests: map[string][]downloadProcess{},
+			wantInChan:           []downloadRequest{},
+			assertProcesses:      func(*testing.T, map[string][]downloadProcess) {},
+			wantInQueue:          map[string][]downloadRequest{},
 		},
 		{
 			name: "queue one",
@@ -66,7 +94,7 @@ func TestIRCClient_EnqueueDownloadRequest(t *testing.T) {
 			wantInChan: []downloadRequest{
 				makeRequest(nick1, hostname1, "123"),
 			},
-			wantInQueue: map[string][]downloadRequest{hostname1: nil},
+			wantInQueue: map[string][]downloadRequest{},
 		},
 		{
 			name: "queue several into existing process",
@@ -263,7 +291,6 @@ func TestIRCClient_EnqueueDownloadRequest(t *testing.T) {
 				makeRequest(nick1, hostname1, "789"),
 			},
 			wantInQueue: map[string][]downloadRequest{
-				hostname1: nil,
 				hostname2: {
 					makeRequest(nick1, hostname2, "88"),
 				},
@@ -391,7 +418,7 @@ func TestIRCClient_EnqueueDownloadRequest(t *testing.T) {
 			}
 			writeBuff := bytes.Buffer{}
 
-			ic.enqueueDownloadRequests(&ircWriter{Writer: &writeBuff}, tt.haveReqs)
+			ic.enqueueDownloadRequests(&ircWriter{Writer: &writeBuff}, nick1, hostname1, tt.haveReqs)
 
 			close(ic.downloadRequestsChan)
 
@@ -450,7 +477,6 @@ func TestIRCClient_ProcessDownloadRequest(t *testing.T) {
 			},
 
 			wantWritten: []string{
-				"PRIVMSG Phoenix :\x01DCC SEND \"fake_file.mkv\" 2130706433 50001 12\x01",
 				"PRIVMSG Phoenix :This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.",
 			},
 			wantDownloadedFile: []byte("this is file"),
@@ -483,17 +509,17 @@ func TestIRCClient_ProcessDownloadRequest(t *testing.T) {
 			},
 
 			wantWritten: []string{
-				"PRIVMSG Phoenix :\x01DCC SEND \"fake_file.mkv\" 2130706433 50001 12\x01",
 				"PRIVMSG Phoenix :This bot is experimental. If you encountered any issue with your download, please reach out to Exterminata on IRC or Ina on the nibl discord.",
 			},
 			wantDownloadedFile: []byte("s file"),
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			port := freeTCPPort(t)
 			ic := &ircClient{
-				portsPool: newPortsPool([]int{50001}),
+				portsPool: newPortsPool([]int{port}),
 				listenerBuilderFactory: &defaultListenerBuilderFactory{
-					externalIP: 2130706433, // 127.0.0.1
+					externalIP: 2130706433,
 					localIP:    "127.0.0.1",
 				},
 				fileFetcher: &fakeFileHandler{
@@ -508,26 +534,70 @@ func TestIRCClient_ProcessDownloadRequest(t *testing.T) {
 					},
 				},
 				downloadProcessesByHostname: tt.processes,
+				downloadQueue:               make(map[string][]downloadRequest),
 			}
-			w := bytes.Buffer{}
+			w := &syncBuffer{}
 
-			err := ic.processDownloadRequest(&ircWriter{Writer: &w}, tt.req)
+			err := ic.processDownloadRequest(&ircWriter{Writer: w}, tt.req)
+
+			require.NoError(t, err)
+
+			conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 
 			require.NoError(t, err)
 
-			conn, err := net.Dial("tcp", "127.0.0.1:50001")
-
-			require.NoError(t, err)
+			defer conn.Close()
 
 			fileBuff, err := io.ReadAll(conn)
 
 			require.NoError(t, err)
 
+			require.NoError(t, conn.Close())
+
 			assert.Equal(t, tt.wantDownloadedFile, fileBuff)
 
-			for _, s := range tt.wantWritten {
+			// ensures the listener is closed
+			require.Eventually(
+				t,
+				func() bool {
+					listener, err := net.Listen(
+						"tcp",
+						net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+					)
+					if err != nil {
+						return false
+					}
+
+					return listener.Close() == nil
+				},
+				2*time.Second,
+				10*time.Millisecond,
+			)
+
+			for _, s := range append(
+				[]string{
+					fmt.Sprintf("PRIVMSG Phoenix :\x01DCC SEND \"fake_file.mkv\" 2130706433 %d 12\x01", port),
+				},
+				tt.wantWritten...,
+			) {
 				assert.Contains(t, w.String(), s)
 			}
 		})
 	}
+}
+
+// freeTCPPort picks a random free port for the downloading test
+// the OS is responsible for assigning a working port.
+// There's a slight risk that the port we picked will have been used
+// in the meantime (TOCTOU) but in that case, just rerun the test.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	require.NoError(t, listener.Close())
+
+	return port
 }

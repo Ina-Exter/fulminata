@@ -367,9 +367,15 @@ func (fh *fsHandler) loadCounts() error {
 
 func (fh *fsHandler) persistCounts() error {
 	fh.countBufferMu.Lock()
+	ucSnapshot := make(map[string]map[string]count, len(fh.countBuffer.UserCounts))
+
+	for k, v := range fh.countBuffer.UserCounts {
+		ucSnapshot[k] = maps.Clone(v)
+	}
+
 	snapshot := countsStruct{
 		DownloadCounts: maps.Clone(fh.countBuffer.DownloadCounts),
-		UserCounts:     maps.Clone(fh.countBuffer.UserCounts),
+		UserCounts:     ucSnapshot,
 	}
 	fh.countBufferMu.Unlock()
 

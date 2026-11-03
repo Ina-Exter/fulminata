@@ -161,6 +161,28 @@ type ircClient struct {
 	ircErrChan chan error
 }
 
+func ircClientFromConfig(c *Config, pool *portsPool, handler FileHandler, remoteIP uint32, certs []tls.Certificate) *ircClient {
+	return &ircClient{
+		nickname:             c.Nick,
+		registrationPassword: c.RegistrationPassword,
+		channel:              c.Channel,
+		blacklistedHostnames: c.BlacklistedHostnames,
+		blacklistedNicks:     c.BlacklistedNicks,
+		listenerBuilderFactory: &defaultListenerBuilderFactory{
+			localIP:      c.LocalIP,
+			externalIP:   remoteIP,
+			certificates: certs,
+		},
+		portsPool:                   pool,
+		rateLimit:                   c.RateLimit,
+		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
+		downloadRequestsChan:        make(chan downloadRequestWithID, 65535),
+		downloadQueue:               make(map[string][]downloadRequest, 65535),
+		ircErrChan:                  make(chan error, 10),
+		fileFetcher:                 handler,
+	}
+}
+
 type formatterWriter struct {
 	w io.Writer
 }

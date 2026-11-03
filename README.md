@@ -5,7 +5,6 @@ Containerized, few dependencies, straightforward (?), and relatively customizabl
 
 ## TODO
 
-- Transfer config to a file
 - Web interface to track and start/stop the bot, refresh the packlist
 - Track channel joiners
 - Auto restart in code

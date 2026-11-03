@@ -90,7 +90,7 @@ func MustNewFSHandler(rootSavePath, counterFile string, pool *portsPool) *fsHand
 		panic(err)
 	}
 
-	persistanceTicker := time.NewTicker(4 * time.Second)
+	persistanceTicker := time.NewTicker(time.Minute)
 
 	go func() {
 		for range persistanceTicker.C {

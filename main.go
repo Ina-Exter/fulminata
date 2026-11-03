@@ -11,9 +11,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"path"
-	"strconv"
-	"strings"
 	"time"
 
 	_ "golang.org/x/crypto/x509roots/fallback"
@@ -114,63 +111,8 @@ func spinTLSConfig() ([]tls.Certificate, error) {
 }
 
 func main() {
-	nick := getEnvFallback("NICK", "Fulminata|Experiment", stringNotEmpty("NICK"))
-	registrationPassword := getEnvFallback("REGISTRATION_PASSWORD", "", func(s string) string { return s })
-	rootSavePath := getEnvFallback("ROOT_FOLDER", "/anime", stringNotEmpty("ROOT_FOLDER"))
-	joinChan := getEnvFallback("CHANNEL", "#exter-periment", stringNotEmpty("CHANNEL"))
-	localIP := getEnvFallback(
-		"LOCAL_IP",
-		"192.168.1.68",
-		func(s string) string {
-			if s == "" {
-				panic("LOCAL_IP cannot be empty")
-			}
+	c := MustLoadConfigFromEnv()
 
-			parsedIP, err := netip.ParseAddr(s)
-
-			if err != nil {
-				panic("cannot parse ip" + err.Error())
-			}
-
-			if !parsedIP.Is4() {
-				panic("IP is not a v4 ip")
-			}
-
-			return s
-		},
-	)
-	ports := getEnvFallback("PORTS", []int{38542, 38543}, func(s string) []int {
-		portsStr := strings.Split(s, ",")
-		ports := make([]int, 0, len(portsStr))
-
-		for _, ps := range portsStr {
-			pint, err := strconv.Atoi(ps)
-
-			if err != nil {
-				panic("invalid port" + ps + ":" + err.Error())
-			}
-
-			if pint <= 0 || pint > 65535 {
-				panic("invalid port" + strconv.Itoa(pint))
-			}
-
-			ports = append(ports, pint)
-		}
-
-		return ports
-	})
-	counterFile := getEnvFallback("DOWNLOADS_COUNTER_FILE_PATH", path.Join(rootSavePath, "downloads_count.json"), stringNotEmpty("DOWNLOADS_COUNTER_FILE_PATH"))
-	rateLimit := getEnvFallback("RATE_LIMIT", 1, func(val string) int {
-		ival, err := strconv.Atoi(val)
-
-		if err != nil || ival <= 0 {
-			panic(fmt.Sprintf("Invalid value %s given to key RATE_LIMIT, expected int", val))
-		}
-
-		return ival
-	})
-	blacklistedNicks := getEnvFallback("BLACKLISTED_NICKS", nil, func(val string) []string { return strings.Split(val, ",") })
-	blacklistedHostnames := getEnvFallback("BLACKLISTED_HOSTNAMES", nil, func(val string) []string { return strings.Split(val, ",") })
 	remoteIP, err := extractIPv4()
 
 	if err != nil {
@@ -183,29 +125,11 @@ func main() {
 		fmt.Println("cannot get tls certificate:", err, ", bot starting without SDCC capabilities")
 	}
 
-	pool := newPortsPool(ports)
+	pool := newPortsPool(c.Ports)
 
-	fsHandler := MustNewFSHandler(rootSavePath, counterFile, pool)
+	fsHandler := MustNewFSHandler(c.RootFolder, c.CounterFilePath, pool)
 
-	ic := ircClient{
-		nickname:             nick,
-		registrationPassword: registrationPassword,
-		channel:              joinChan,
-		blacklistedHostnames: blacklistedHostnames,
-		blacklistedNicks:     blacklistedNicks,
-		listenerBuilderFactory: &defaultListenerBuilderFactory{
-			localIP:      localIP,
-			externalIP:   remoteIP,
-			certificates: certs,
-		},
-		portsPool:                   pool,
-		rateLimit:                   rateLimit,
-		downloadProcessesByHostname: make(map[string][]downloadProcess, 65535),
-		downloadRequestsChan:        make(chan downloadRequestWithID, 65535),
-		downloadQueue:               make(map[string][]downloadRequest, 65535),
-		ircErrChan:                  make(chan error, 10),
-		fileFetcher:                 fsHandler,
-	}
+	ic := ircClientFromConfig(c, pool, fsHandler, remoteIP, certs)
 
 	reportingTicker := time.NewTicker(time.Minute)
 

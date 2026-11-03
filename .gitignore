@@ -2,6 +2,7 @@ data/*
 mount/*
 secrets/*
 registration.json
+config.json
 list.txt
 fulminata.tar
 fulminata

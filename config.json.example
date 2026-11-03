@@ -1,0 +1,14 @@
+{
+  "nick": "Nick",
+  "registration_password": "", // leave empty for no registration
+  "root_folder": "data/",
+  "channel": "#my-channel",
+  "local_ip": "10.0.0.1", // fill with local adapter IP
+  "ports": [
+    23456 // may add more
+  ],
+  "downloads_counter_file_path": "data/downloads_count.json",
+  "rate_limit": 1,
+  "blacklisted_nicks": null,
+  "blacklisted_hostnames": null
+}
